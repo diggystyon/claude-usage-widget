@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Claude Usage Bridge",
+  "version": "1.0.0",
+  "description": "Sends your claude.ai session and weekly usage to the Claude Usage tray widget. Localhost only; nothing leaves your machine.",
+  "permissions": ["alarms", "storage"],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "http://127.0.0.1:38080/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icon-16.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
+  },
+  "action": {
+    "default_title": "Claude Usage Bridge"
+  }
+}
