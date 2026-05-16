@@ -1,0 +1,87 @@
+name: Build Windows
+
+# Runs on every tag push matching v*.*.* and on manual button clicks.
+# Produces Claude Usage Setup.exe attached to the GitHub release on tag pushes,
+# and as a downloadable build artifact on manual runs.
+#
+# Mirrors the local rebuild_and_install.bat pipeline:
+#   1. Generate app.ico (make_icon.py)
+#   2. PyInstaller bundles claude_usage_tray.py -> dist/Claude Usage.exe
+#   3. Inno Setup compiles installer.iss -> installer_dist/Claude Usage Setup.exe
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write   # needed for upload to release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          if (Test-Path requirements.txt) {
+            pip install -r requirements.txt
+          } else {
+            Write-Host "::warning::requirements.txt not found -- using fallback list"
+            pip install httpx pystray Pillow pywin32 cryptography winotify
+          }
+
+      - name: Generate icon
+        shell: pwsh
+        run: |
+          if (Test-Path make_icon.py) {
+            python make_icon.py
+          }
+
+      - name: Build exe with PyInstaller
+        shell: pwsh
+        run: |
+          if (-not (Test-Path claude_usage_tray.py)) {
+            Write-Host "::error::claude_usage_tray.py not found"
+            exit 1
+          }
+          pyinstaller `
+            --noconsole `
+            --onefile `
+            --name "Claude Usage" `
+            --icon=app.ico `
+            --add-data "app.ico;." `
+            --hidden-import=win32crypt `
+            --hidden-import=cryptography.hazmat.primitives.ciphers.aead `
+            --hidden-import=winotify `
+            --collect-data certifi `
+            --distpath dist `
+            --clean `
+            --noconfirm `
+            claude_usage_tray.py
+
+      - name: Compile installer with Inno Setup
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.5
+        with:
+          path: installer.iss
+          options: /O+
+
+      - name: Upload artifact (for manual runs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Claude-Usage-Setup
+          path: installer_dist/Claude Usage Setup.exe
+
+      - name: Attach .exe to release (for tag pushes)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer_dist/Claude Usage Setup.exe
