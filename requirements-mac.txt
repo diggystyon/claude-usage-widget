@@ -1,0 +1,9 @@
+# Runtime dependencies for the macOS menu bar build.
+# Pinned to the same minor versions as the Windows build for parity.
+rumps>=0.4.0
+httpx>=0.27.0
+Pillow>=10.0.0
+cryptography>=42.0.0
+
+# Build-time only (PyInstaller bundles the others into the .app).
+pyinstaller>=6.0.0
