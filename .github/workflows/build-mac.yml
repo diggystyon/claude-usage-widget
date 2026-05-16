@@ -1,0 +1,121 @@
+name: Build Mac
+
+# Runs on every tag push matching v*.*.* and also on a manual button click.
+# Produces a Claude Usage.dmg attached to the GitHub release for tag pushes,
+# and as a downloadable build artifact for manual runs.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write   # needed for upload to release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements-mac.txt ]; then
+            pip install -r requirements-mac.txt
+          else
+            echo "::warning::requirements-mac.txt not found yet -- using fallback list"
+            pip install rumps httpx Pillow pync pyinstaller
+          fi
+
+      - name: Generate icons
+        run: |
+          if [ -f make_icon.py ]; then
+            python make_icon.py
+          fi
+          # Convert app.ico -> app.icns if needed (Mac uses .icns)
+          if [ ! -f app.icns ] && [ -f app.ico ]; then
+            python - <<'PY'
+          from PIL import Image
+          import os, subprocess, tempfile
+          img = Image.open("app.ico")
+          # Pick the largest frame
+          best = max((f for f in img.size, *(getattr(img, "n_frames", 1) > 1 and [
+              Image.open("app.ico").seek(i) or Image.open("app.ico") for i in range(img.n_frames)
+          ] or [])), key=lambda i: i[0] if isinstance(i, tuple) else i.size[0]) if False else img
+          # Build an .iconset directory then iconutil it
+          with tempfile.TemporaryDirectory() as d:
+              iconset = os.path.join(d, "app.iconset")
+              os.makedirs(iconset)
+              for size in (16, 32, 64, 128, 256, 512, 1024):
+                  resized = img.resize((size, size), Image.LANCZOS)
+                  resized.save(os.path.join(iconset, f"icon_{size}x{size}.png"))
+                  if size <= 512:
+                      resized.save(os.path.join(iconset, f"icon_{size//2 if size > 16 else size}x{size//2 if size > 16 else size}@2x.png"))
+              subprocess.run(["iconutil", "-c", "icns", iconset, "-o", "app.icns"], check=True)
+          PY
+          fi
+
+      - name: Build app bundle with PyInstaller
+        run: |
+          if [ ! -f claude_usage_menubar.py ]; then
+            echo "::error::claude_usage_menubar.py not found -- the Mac source isn't in the repo yet."
+            exit 1
+          fi
+          pyinstaller \
+            --windowed \
+            --onedir \
+            --name "Claude Usage" \
+            --icon app.icns \
+            --osx-bundle-identifier com.diggystyon.claudeusage \
+            --noconfirm \
+            claude_usage_menubar.py
+
+      - name: Strip extended attributes
+        run: |
+          xattr -cr "dist/Claude Usage.app"
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Build DMG
+        run: |
+          # If you've shipped a custom DMG background image, it'll be picked up
+          # here. Otherwise create-dmg uses a plain default.
+          BG_ARG=""
+          if [ -f dmg_bg.png ]; then
+            BG_ARG="--background dmg_bg.png"
+          fi
+          create-dmg \
+            --volname "Claude Usage" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "Claude Usage.app" 175 190 \
+            --hide-extension "Claude Usage.app" \
+            --app-drop-link 425 190 \
+            $BG_ARG \
+            --no-internet-enable \
+            "Claude Usage.dmg" \
+            "dist/Claude Usa ge.app" \
+            || true
+          # create-dmg sometimes returns non-zero on cosmetic issues even when
+          # the DMG is fine; verify the file exists.
+          test -f "Claude Usage.dmg"
+
+      - name: Upload as artifact (for manual runs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Claude-Usage-DMG
+          path: Claude Usage.dmg
+
+      - name: Attach DMG to release (for tag pushes)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Claude Usage.dmg
