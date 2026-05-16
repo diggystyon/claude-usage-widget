@@ -42,7 +42,7 @@ BUNDLE_NAME = "Claude Usage.app"
 APP_INSTALL_PATH = "/Applications/Claude Usage.app"
 CLAUDE_APP_PATH = "/Applications/Claude.app"
 CLAUDE_DOWNLOAD_URL = "https://claude.ai/download"
-__version__ = "1.0.0"
+__version__ = "1.1.1"
 
 # Update check uses the same GitHub Releases endpoint as the Windows build.
 UPDATE_VERSION_URL  = "https://api.github.com/repos/diggystyon/claude-usage-widget/releases/latest"
@@ -194,10 +194,34 @@ STATUS_COLORS = {
 CLAUDE_STATUS_URL = "https://status.claude.com/"
 
 
-def fetch_claude_status() -> Optional[Tuple[str, str]]:
+def _status_client() -> Optional[httpx.Client]:
+    """Three-strategy SSL setup for the status endpoint. PyInstaller bundles
+    can fail to find certifi's CA file from a plain ssl.create_default_context
+    call; we fall back to certifi explicitly, then verify=False as a last
+    resort. Public read-only endpoint, so verify=False is acceptable here."""
     try:
-        with httpx.Client(timeout=10.0) as client:
-            r = client.get("https://status.claude.com/api/v2/components.json")
+        return httpx.Client(timeout=10.0)
+    except Exception as e:
+        logging.warning("status client default SSL setup failed: %s", e)
+    try:
+        import certifi
+        return httpx.Client(timeout=10.0, verify=certifi.where())
+    except Exception as e:
+        logging.warning("status client certifi SSL setup failed: %s", e)
+    try:
+        return httpx.Client(timeout=10.0, verify=False)
+    except Exception:
+        logging.exception("status client unverified setup also failed")
+        return None
+
+
+def fetch_claude_status() -> Optional[Tuple[str, str]]:
+    client = _status_client()
+    if client is None:
+        return None
+    try:
+        with client as c:
+            r = c.get("https://status.claude.com/api/v2/components.json")
             if r.status_code != 200:
                 return None
             data = r.json()
@@ -490,11 +514,10 @@ def _ensure_claude_app_or_prompt() -> bool:
         )
         if choice == "Open Download Page":
             _open_url(CLAUDE_DOWNLOAD_URL)
-            # Loop back: dialog reappears so user can confirm after install.
             time.sleep(2)
             continue
         if choice == "I've Installed It":
-            continue  # Loop will re-check the path.
+            continue
         return False
 
 
@@ -524,15 +547,13 @@ class MenuBarApp(rumps.App):
     EXTENSION_FRESHNESS_SEC = 180
 
     def __init__(self):
-        # rumps.App needs an icon path at construction. Render an initial
-        # icon and save it; we'll keep overwriting this file on refresh.
         self._write_icon(0, 0, None)
         super().__init__(
             APP_DISPLAY_NAME,
             icon=str(ICON_TMP),
-            title="",  # no text next to the icon
-            quit_button=None,  # we add our own Quit so it appears at bottom
-            template=False,    # we have full-color bars; don't auto-tint
+            title="",
+            quit_button=None,
+            template=False,
         )
 
         self.config = load_config()
@@ -544,7 +565,6 @@ class MenuBarApp(rumps.App):
         self.stop_evt = threading.Event()
         self.last_fetch_at: float = 0.0
 
-        # Dynamic menu items kept as instance attrs so we can update titles.
         self.mi_pct       = rumps.MenuItem("Session: --%   Weekly: --%")
         self.mi_source    = rumps.MenuItem("Source: -")
         self.mi_status    = rumps.MenuItem("Claude.ai: -")
@@ -563,11 +583,9 @@ class MenuBarApp(rumps.App):
         self.mi_quit      = rumps.MenuItem("Quit Claude Usage",
                                            callback=self.cb_quit)
 
-        # Checkbox state.
         self.mi_auto.state   = 1 if self.config.get("auto_refresh", True) else 0
         self.mi_notify.state = 1 if self.config.get("notify_on_failure", True) else 0
 
-        # Disable info rows (no callback => grey label).
         for itm in (self.mi_pct, self.mi_source, self.mi_status):
             itm.set_callback(None)
 
@@ -586,7 +604,6 @@ class MenuBarApp(rumps.App):
             self.mi_quit,
         ]
 
-        # Background threads. Daemon=True so they don't block app quit.
         threading.Thread(target=self._poll_loop,         daemon=True).start()
         threading.Thread(target=self._status_poll_loop,  daemon=True).start()
         threading.Thread(target=self._update_check_loop, daemon=True).start()
@@ -604,14 +621,11 @@ class MenuBarApp(rumps.App):
     def _refresh_icon_and_menu(self) -> None:
         dot = STATUS_COLORS.get(self.claude_status_key, (None, None))[1]
         self._write_icon(self.session_pct, self.weekly_pct, dot)
-        # rumps re-loads the icon when you reassign it. Setting to the same
-        # path with a fresh write forces NSImage to reload from disk.
         try:
             self.icon = str(ICON_TMP)
         except Exception:
             logging.exception("icon reassign failed")
 
-        # Update menu text.
         src = self.config.get("last_source") or "-"
         self.mi_pct.title = (
             f"Session: {self.session_pct:.0f}%   "
@@ -637,6 +651,18 @@ class MenuBarApp(rumps.App):
 
     def cb_refresh(self, _) -> None:
         threading.Thread(target=self._fetch_once, daemon=True).start()
+        threading.Thread(target=self._check_status_once, daemon=True).start()
+
+    def _check_status_once(self) -> None:
+        """One-shot status fetch + UI refresh. Lets the user force a status
+        update via 'Refresh now' without waiting for the 5-minute poll."""
+        try:
+            res = fetch_claude_status()
+            if res is not None:
+                self.claude_status_key, self.claude_status_label = res
+                self._refresh_icon_and_menu()
+        except Exception:
+            logging.exception("manual status check failed")
 
     def cb_status_page(self, _) -> None:
         _open_url(CLAUDE_STATUS_URL)
@@ -681,7 +707,6 @@ class MenuBarApp(rumps.App):
         if not self.config.get("notify_on_failure", True):
             return
         last = float(self.config.get("last_failure_notified_at", 0))
-        # At most one failure toast per hour.
         if time.time() - last < 3600:
             return
         self.config["last_failure_notified_at"] = time.time()
@@ -721,7 +746,6 @@ class MenuBarApp(rumps.App):
         self._refresh_icon_and_menu()
 
     def _poll_loop(self) -> None:
-        # Quick first fetch so the UI is fresh within a few seconds of launch.
         self.stop_evt.wait(2)
         while not self.stop_evt.is_set():
             try:
@@ -741,7 +765,7 @@ class MenuBarApp(rumps.App):
                     self._refresh_icon_and_menu()
             except Exception:
                 logging.exception("status loop error")
-            self.stop_evt.wait(300)  # every 5 min
+            self.stop_evt.wait(300)
 
     def _update_check_loop(self) -> None:
         notified_for: Optional[str] = None
@@ -772,8 +796,6 @@ def main() -> int:
     if sys.platform != "darwin":
         print("This build only runs on macOS.", file=sys.stderr)
         return 1
-    # First-launch dialog (Claude.app check, login-item registration) runs
-    # BEFORE we hand control to rumps.run() so the modal dialogs work.
     try:
         if not _first_launch_setup():
             logging.info("user cancelled first-launch setup; exiting")
