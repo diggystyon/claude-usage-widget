@@ -55,6 +55,7 @@ jobs:
             --name "Claude Usage" \
             --icon app.icns \
             --osx-bundle-identifier com.diggystyon.claudeusage \
+            --collect-data certifi \
             --noconfirm \
             claude_usage_menubar.py
 
