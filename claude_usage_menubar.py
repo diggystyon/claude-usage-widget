@@ -42,7 +42,7 @@ BUNDLE_NAME = "Claude Usage.app"
 APP_INSTALL_PATH = "/Applications/Claude Usage.app"
 CLAUDE_APP_PATH = "/Applications/Claude.app"
 CLAUDE_DOWNLOAD_URL = "https://claude.ai/download"
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 # Update check uses the same GitHub Releases endpoint as the Windows build.
 UPDATE_VERSION_URL  = "https://api.github.com/repos/diggystyon/claude-usage-widget/releases/latest"
