@@ -38,7 +38,7 @@ import cookie_sources
 APP_NAME = "ClaudeUsageTray"
 APP_DISPLAY_NAME = "Claude Usage"
 APP_USER_MODEL_ID = "diggystyon.ClaudeUsageTray"
-__version__ = "1.1.2"  # bump this AND installer.iss "#define AppVersion" together
+__version__ = "1.1.3"  # bump this AND installer.iss "#define AppVersion" together
 
 # --- update-check config (GitHub Releases) ---
 # UPDATE_VERSION_URL hits GitHub's REST API and returns JSON for the latest
