@@ -1,0 +1,6 @@
+pystray>=0.19.5
+Pillow>=10.0.0
+httpx>=0.27.0
+cryptography>=42.0.0
+pywin32>=306; platform_system == "Windows"
+winotify>=1.1.0; platform_system == "Windows"
