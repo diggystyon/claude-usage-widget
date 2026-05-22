@@ -3,7 +3,7 @@
 ; Output: installer_dist\Claude Usage Setup.exe
 
 #define AppName       "Claude Usage"
-#define AppVersion    "1.1.1"
+#define AppVersion    "1.1.2"
 #define AppPublisher  "diggystyon"
 #define AppExeName    "Claude Usage.exe"
 #define AppId         "{{C61D6A7B-9E0E-4C2C-9F2A-CLAUDEUSAGE001}"
