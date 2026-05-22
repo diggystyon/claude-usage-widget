@@ -42,7 +42,7 @@ BUNDLE_NAME = "Claude Usage.app"
 APP_INSTALL_PATH = "/Applications/Claude Usage.app"
 CLAUDE_APP_PATH = "/Applications/Claude.app"
 CLAUDE_DOWNLOAD_URL = "https://claude.ai/download"
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 # Update check uses the same GitHub Releases endpoint as the Windows build.
 UPDATE_VERSION_URL  = "https://api.github.com/repos/diggystyon/claude-usage-widget/releases/latest"
@@ -64,6 +64,55 @@ logging.getLogger().setLevel(_log_level)
 logging.getLogger().addHandler(_log_handler)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def _setup_bundled_certifi() -> None:
+    """Make TLS verification work inside the PyInstaller .app bundle.
+
+    PyInstaller's --collect-data certifi flag copies cacert.pem into the
+    bundle, but at runtime certifi.where() can still return a path that
+    doesn't resolve. When that happens, httpx defaults fail with [Errno 2]
+    and we silently slide to verify=False. Point SSL_CERT_FILE at a real
+    on-disk cacert.pem before any httpx.Client is constructed.
+
+    Search order:
+      1. respect an explicit SSL_CERT_FILE the user already set
+      2. certifi.where() if the file exists
+      3. {sys._MEIPASS}/certifi/cacert.pem (PyInstaller --onefile)
+      4. {Contents/Resources}/certifi/cacert.pem (.app bundle layout)
+      5. {bundle dir}/certifi/cacert.pem (PyInstaller --onedir)
+    """
+    try:
+        if os.environ.get("SSL_CERT_FILE") and os.path.isfile(os.environ["SSL_CERT_FILE"]):
+            return
+        candidates: List[str] = []
+        try:
+            import certifi
+            candidates.append(certifi.where())
+        except Exception:
+            pass
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(os.path.join(meipass, "certifi", "cacert.pem"))
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        # macOS .app layout: Contents/MacOS/Claude Usage -> ../Resources/certifi
+        candidates.append(os.path.join(exe_dir, "..", "Resources", "certifi", "cacert.pem"))
+        candidates.append(os.path.join(exe_dir, "certifi", "cacert.pem"))
+        for path in candidates:
+            if not path:
+                continue
+            resolved = os.path.normpath(path)
+            if os.path.isfile(resolved):
+                os.environ["SSL_CERT_FILE"] = resolved
+                os.environ["REQUESTS_CA_BUNDLE"] = resolved
+                logging.info("TLS CA bundle: %s", resolved)
+                return
+        logging.warning("no CA bundle found; httpx will fall back to verify=False")
+    except Exception:
+        logging.exception("certifi bundle setup failed")
+
+
+_setup_bundled_certifi()
 
 
 DEFAULT_CONFIG = {
@@ -755,14 +804,36 @@ class MenuBarApp(rumps.App):
             self.stop_evt.wait(int(self.config.get("poll_seconds", 60)))
 
     def _status_poll_loop(self) -> None:
+        """Poll status.claude.com every 5 minutes. Notify on transitions both
+        ways (operational -> not, and back to operational) so the user gets
+        the green-arrow signal too, not just the yellow."""
+        first = True
         while not self.stop_evt.is_set():
             try:
                 res = fetch_claude_status()
                 if res:
-                    key, label = res
-                    self.claude_status_key = key
-                    self.claude_status_label = label
+                    new_key, new_label = res
+                    prev_key = self.claude_status_key
+                    self.claude_status_key = new_key
+                    self.claude_status_label = new_label
+                    if first:
+                        logging.info("claude.ai status: %s", new_key)
+                    elif prev_key != new_key:
+                        logging.info("claude.ai status change: %s -> %s",
+                                     prev_key, new_key)
+                        if prev_key == "operational" and new_key != "operational":
+                            show_notification(
+                                f"Claude.ai status: {new_label}",
+                                f"status.claude.com is reporting: {new_label}.",
+                            )
+                        elif prev_key != "operational" and new_key == "operational":
+                            show_notification(
+                                "Claude.ai is back to normal",
+                                "status.claude.com now reports all systems "
+                                "operational.",
+                            )
                     self._refresh_icon_and_menu()
+                first = False
             except Exception:
                 logging.exception("status loop error")
             self.stop_evt.wait(300)
