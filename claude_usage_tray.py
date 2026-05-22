@@ -38,7 +38,7 @@ import cookie_sources
 APP_NAME = "ClaudeUsageTray"
 APP_DISPLAY_NAME = "Claude Usage"
 APP_USER_MODEL_ID = "diggystyon.ClaudeUsageTray"
-__version__ = "1.1.1"  # bump this AND installer.iss "#define AppVersion" together
+__version__ = "1.1.2"  # bump this AND installer.iss "#define AppVersion" together
 
 # --- update-check config (GitHub Releases) ---
 # UPDATE_VERSION_URL hits GitHub's REST API and returns JSON for the latest
@@ -75,6 +75,51 @@ def _set_app_user_model_id() -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
     except Exception:
         logging.exception("could not set AppUserModelID")
+
+
+def _setup_bundled_certifi() -> None:
+    """Make TLS verification work inside the PyInstaller bundle.
+
+    PyInstaller's --collect-data certifi flag copies cacert.pem into the bundle,
+    but at runtime certifi.where() can still return a path that doesn't resolve
+    (depending on how the runtime hook fires). When that happens, httpx defaults
+    fail with [Errno 2] and we silently slide to verify=False. To prevent that,
+    we explicitly point SSL_CERT_FILE / REQUESTS_CA_BUNDLE at a real on-disk
+    cacert.pem before any httpx.Client is constructed.
+
+    Search order:
+      1. respect an explicit SSL_CERT_FILE the user already set
+      2. certifi.where() if the file exists
+      3. {sys._MEIPASS}/certifi/cacert.pem (PyInstaller --onefile extraction dir)
+      4. {bundle dir}/certifi/cacert.pem (PyInstaller --onedir, or Mac .app)
+    """
+    try:
+        if os.environ.get("SSL_CERT_FILE") and os.path.isfile(os.environ["SSL_CERT_FILE"]):
+            return
+        candidates: List[str] = []
+        try:
+            import certifi
+            candidates.append(certifi.where())
+        except Exception:
+            pass
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(os.path.join(meipass, "certifi", "cacert.pem"))
+        # PyInstaller --onedir: data sits next to the executable.
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.append(os.path.join(exe_dir, "certifi", "cacert.pem"))
+        for path in candidates:
+            if path and os.path.isfile(path):
+                os.environ["SSL_CERT_FILE"] = path
+                os.environ["REQUESTS_CA_BUNDLE"] = path
+                logging.info("TLS CA bundle: %s", path)
+                return
+        logging.warning("no CA bundle found; httpx will fall back to verify=False")
+    except Exception:
+        logging.exception("certifi bundle setup failed")
+
+
+_setup_bundled_certifi()
 
 
 DEFAULT_CONFIG = {
@@ -806,8 +851,8 @@ class TrayApp:
 
     def _status_poll_loop(self) -> None:
         """Every 5 minutes, check status.claude.com for the claude.ai
-        component status and update our icon dot. Toast on first transition
-        from operational to anything else."""
+        component status and update our icon dot. Toast on transitions both
+        ways (operational -> not, and back to operational)."""
         first = True
         while not self.stop_evt.is_set():
             try:
@@ -817,14 +862,23 @@ class TrayApp:
                     prev_key = self.claude_status_key
                     self.claude_status_key = new_key
                     self.claude_status_label = new_label
-                    if (not first) and prev_key == "operational" and new_key != "operational":
-                        show_toast(
-                            "Claude.ai status: " + new_label,
-                            f"status.claude.com is reporting: {new_label}.",
-                        )
-                        logging.info("claude.ai status change: %s -> %s", prev_key, new_key)
                     if first:
                         logging.info("claude.ai status: %s", new_key)
+                    elif prev_key != new_key:
+                        logging.info("claude.ai status change: %s -> %s",
+                                     prev_key, new_key)
+                        if prev_key == "operational" and new_key != "operational":
+                            # Things just went sideways.
+                            show_toast(
+                                "Claude.ai status: " + new_label,
+                                f"status.claude.com is reporting: {new_label}.",
+                            )
+                        elif prev_key != "operational" and new_key == "operational":
+                            # Recovery.
+                            show_toast(
+                                "Claude.ai is back to normal",
+                                "status.claude.com now reports all systems operational.",
+                            )
                     self._refresh_icon()
                 first = False
             except Exception:
