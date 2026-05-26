@@ -3,7 +3,15 @@
 ; Output: installer_dist\Claude Usage Setup.exe
 
 #define AppName       "Claude Usage"
-#define AppVersion    "1.2.0"
+; AppVersion is normally passed on the ISCC command line as
+;   /DAppVersion=1.2.3
+; sourced from _version.py by both rebuild_and_install.bat (local) and
+; .github/workflows/build-windows.yml (CI). The fallback below only
+; fires if someone invokes ISCC directly without /DAppVersion, in which
+; case a clearly-fake version makes the misuse obvious.
+#ifndef AppVersion
+  #define AppVersion "0.0.0-dev"
+#endif
 #define AppPublisher  "diggystyon"
 #define AppExeName    "Claude Usage.exe"
 #define AppId         "{{C61D6A7B-9E0E-4C2C-9F2A-CLAUDEUSAGE001}"

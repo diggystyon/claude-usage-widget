@@ -62,6 +62,15 @@ jobs:
             python make_icon.py
           }
 
+      # Read the version from _version.py (single source of truth) and
+      # expose it as $env:APP_VERSION for the Inno Setup step below.
+      - name: Read app version from _version.py
+        shell: pwsh
+        run: |
+          $ver = python -c "from _version import __version__; print(__version__)"
+          Write-Host "APP_VERSION=$ver"
+          "APP_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Build exe with PyInstaller
         shell: pwsh
         run: |
@@ -92,7 +101,9 @@ jobs:
         uses: Minionguyjpro/Inno-Setup-Action@v1.2.5
         with:
           path: installer.iss
-          options: /O+
+          # /DAppVersion injects the version read from _version.py above.
+          # installer.iss has a #ifndef fallback for the dev-direct-invoke case.
+          options: /O+ /DAppVersion=${{ env.APP_VERSION }}
 
       - name: Upload artifact (for manual runs)
         uses: actions/upload-artifact@v4

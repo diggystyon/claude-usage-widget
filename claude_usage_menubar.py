@@ -34,6 +34,7 @@ import rumps
 from PIL import Image, ImageDraw
 
 import mac_cookie_sources
+from _version import __version__  # single source of truth -- bump _version.py only
 
 APP_NAME = "ClaudeUsageTray"
 APP_DISPLAY_NAME = "Claude Usage"
@@ -41,7 +42,6 @@ BUNDLE_NAME = "Claude Usage.app"
 APP_INSTALL_PATH = "/Applications/Claude Usage.app"
 CLAUDE_APP_PATH = "/Applications/Claude.app"
 CLAUDE_DOWNLOAD_URL = "https://claude.ai/download"
-__version__ = "1.2.0"
 
 # Update check uses the same GitHub Releases endpoint as the Windows build.
 UPDATE_VERSION_URL  = "https://api.github.com/repos/diggystyon/claude-usage-widget/releases/latest"

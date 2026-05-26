@@ -69,7 +69,18 @@ if not exist "dist\Claude Usage.exe" (
   goto :err
 )
 
-"%ISCC%" installer.iss
+REM Read the version from _version.py (single source of truth) and pass
+REM it to ISCC as /DAppVersion=... . installer.iss has a #ifndef fallback
+REM for the dev-direct-invoke case, but we always want the real value.
+for /f %%v in ('python -c "from _version import __version__; print(__version__)"') do set "APP_VERSION=%%v"
+if not defined APP_VERSION (
+  echo.
+  echo Could not read __version__ from _version.py.
+  goto :err
+)
+echo Using AppVersion=%APP_VERSION% from _version.py
+
+"%ISCC%" /DAppVersion=%APP_VERSION% installer.iss
 if errorlevel 1 goto :err
 
 REM ----------------------------------------------------------

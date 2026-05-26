@@ -34,11 +34,11 @@ import pystray
 from PIL import Image, ImageDraw
 
 import cookie_sources
+from _version import __version__  # single source of truth -- bump _version.py only
 
 APP_NAME = "ClaudeUsageTray"
 APP_DISPLAY_NAME = "Claude Usage"
 APP_USER_MODEL_ID = "diggystyon.ClaudeUsageTray"
-__version__ = "1.2.0"  # bump this AND installer.iss "#define AppVersion" together
 
 # --- update-check config (GitHub Releases) ---
 # UPDATE_VERSION_URL hits GitHub's REST API and returns JSON for the latest
