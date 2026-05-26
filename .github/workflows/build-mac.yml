@@ -1,13 +1,16 @@
 name: Build Mac
 
 # Runs on every tag push matching v*.*.* and also on a manual button click.
-# Produces a Claude Usage.dmg attached to the GitHub release for tag pushes,
-# and as a downloadable build artifact for manual runs.
+# Produces TWO DMGs per release -- one for Apple Silicon, one for Intel --
+# both attached to the GitHub release for tag pushes (and as downloadable
+# artifacts for manual runs).
 #
-# Note: macos-latest currently resolves to an Apple-Silicon runner, so the
-# DMG produced here is ARM64-only. Intel Macs will see "this app is not
-# supported on your Mac" unless we add an Intel runner to a matrix and lipo
-# the two binaries together. README-MAC documents the current limitation.
+# Why a matrix instead of a lipo'd fat binary: PyInstaller can't produce a
+# universal binary in one pass; you'd need to build separately per arch and
+# splice the resulting Mach-O executables + Frameworks together by hand.
+# The matrix approach is simpler and the user-facing UX is one extra
+# decision at download time ("which one matches my Mac?") -- documented in
+# README-MAC.
 on:
   push:
     tags:
@@ -15,12 +18,34 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: build-mac
+  # Per-arch concurrency so a re-run of one arch doesn't queue behind the
+  # other. cancel-in-progress stays false: we want both builds to finish,
+  # not get killed when a newer tag lands minutes later.
+  group: build-mac-${{ matrix.arch }}
   cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: macos-latest
+    strategy:
+      # Let one arch finish even if the other fails. A partial release
+      # (one arch attached, one missing) is worse than no release, but
+      # MUCH better than zero builds finishing because Intel had a flake
+      # in step 3.
+      fail-fast: false
+      matrix:
+        include:
+          # macos-latest currently resolves to an Apple Silicon (arm64)
+          # runner. If GitHub flips that default in the future, pin to
+          # macos-14 or macos-15 explicitly here.
+          - runner: macos-latest
+            arch: arm64
+          # macos-13 is currently the youngest Intel-on-macOS runner image
+          # GitHub publishes. Bump deliberately if/when GitHub retires it
+          # (will likely surface as a "deprecated runner" warning weeks
+          # before removal).
+          - runner: macos-13
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     permissions:
       contents: write   # needed for upload to release
@@ -76,6 +101,16 @@ jobs:
             --noconfirm \
             claude_usage_menubar.py
 
+      - name: Verify built arch matches runner
+        run: |
+          BIN="dist/Claude Usage.app/Contents/MacOS/Claude Usage"
+          ACTUAL_ARCH=$(lipo -archs "$BIN" 2>/dev/null || file -b "$BIN")
+          echo "Built binary arch: $ACTUAL_ARCH (expected: ${{ matrix.arch }})"
+          case "${{ matrix.arch }}" in
+            arm64)  echo "$ACTUAL_ARCH" | grep -q "arm64"  || { echo "::error::Expected arm64, got $ACTUAL_ARCH"; exit 1; } ;;
+            x86_64) echo "$ACTUAL_ARCH" | grep -q "x86_64" || { echo "::error::Expected x86_64, got $ACTUAL_ARCH"; exit 1; } ;;
+          esac
+
       - name: Strip extended attributes
         run: |
           xattr -cr "dist/Claude Usage.app"
@@ -95,7 +130,7 @@ jobs:
             ls -la "dist/Claude Usage.app/Contents/MacOS/" 2>&1 || true
             exit 1
           fi
-          echo "Launching widget for 15s smoke test..."
+          echo "Launching widget for 15s smoke test (arch=${{ matrix.arch }})..."
           "$APP_BIN" >app-stdout.log 2>app-stderr.log &
           PID=$!
           sleep 15
@@ -131,8 +166,12 @@ jobs:
 
       - name: Build DMG
         run: |
-          # If you've shipped a custom DMG background image, it'll be picked up
-          # here. Otherwise create-dmg uses a plain default.
+          # Per-arch DMG filename so the two matrix jobs don't overwrite
+          # each other's artifact at upload time and so users can tell at
+          # a glance which one matches their Mac.
+          DMG_NAME="Claude Usage-${{ matrix.arch }}.dmg"
+          echo "DMG_NAME=$DMG_NAME" >> $GITHUB_ENV
+
           BG_ARG=""
           if [ -f dmg_bg.png ]; then
             BG_ARG="--background dmg_bg.png"
@@ -150,16 +189,18 @@ jobs:
             --app-drop-link 425 190 \
             $BG_ARG \
             --no-internet-enable \
-            "Claude Usage.dmg" \
+            "$DMG_NAME" \
             "dist/Claude Usage.app" \
             || true
-          test -f "Claude Usage.dmg"
+          test -f "$DMG_NAME"
 
       - name: Upload as artifact (for manual runs)
         uses: actions/upload-artifact@v4
         with:
-          name: Claude-Usage-DMG
-          path: Claude Usage.dmg
+          # Per-arch artifact name -- otherwise the two matrix jobs would
+          # try to upload to the same artifact and one would fail.
+          name: Claude-Usage-DMG-${{ matrix.arch }}
+          path: ${{ env.DMG_NAME }}
 
       # Third-party Action pinned to a specific patch version. Pin to SHA
       # if/when you want maximum supply-chain hygiene.
@@ -167,4 +208,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2.1.0
         with:
-          files: Claude Usage.dmg
+          files: ${{ env.DMG_NAME }}

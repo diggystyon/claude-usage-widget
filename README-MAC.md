@@ -6,11 +6,16 @@ Shows your current Claude.ai session and weekly usage as two colored bars in you
 
 1. **The Claude desktop app**, installed and signed in. Get it from [claude.ai/download](https://claude.ai/download). The widget reads its sign-in cookies so it can fetch your usage from Claude. Without it, the widget has nothing to read.
 2. **macOS 12 (Monterey) or newer.**
-3. **Apple Silicon Mac (M1/M2/M3/M4).** Current builds are ARM64-only. Intel Mac support requires building from source; the prebuilt DMG will not launch on Intel.
+3. **Apple Silicon (M1/M2/M3/M4) or Intel Mac.** Each release ships two DMGs; download the one that matches your Mac (see below).
 
 ## Install
 
-1. Download `Claude Usage.dmg` from the [latest release](https://github.com/diggystyon/claude-usage-widget/releases/latest).
+1. Go to the [latest release](https://github.com/diggystyon/claude-usage-widget/releases/latest). Download the right DMG for your Mac:
+   - **Apple Silicon (M1/M2/M3/M4):** `Claude Usage-arm64.dmg`
+   - **Intel:** `Claude Usage-x86_64.dmg`
+
+   Not sure which you have? Apple menu > About This Mac. If "Chip" says M1/M2/M3/M4, pick arm64. If "Processor" says Intel, pick x86_64.
+
 2. Double-click the `.dmg` file. A window opens showing the app icon and an arrow pointing at the Applications folder.
 3. **Drag the app icon onto the Applications folder shortcut.**
 4. Open the Applications folder and find **Claude Usage**.
