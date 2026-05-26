@@ -17,13 +17,6 @@ on:
       - 'v*.*.*'
   workflow_dispatch:
 
-concurrency:
-  # Per-arch concurrency so a re-run of one arch doesn't queue behind the
-  # other. cancel-in-progress stays false: we want both builds to finish,
-  # not get killed when a newer tag lands minutes later.
-  group: build-mac-${{ matrix.arch }}
-  cancel-in-progress: false
-
 jobs:
   build:
     strategy:
@@ -45,6 +38,14 @@ jobs:
           # before removal).
           - runner: macos-13
             arch: x86_64
+    # Per-arch concurrency so a re-run of one arch doesn't queue behind
+    # the other. cancel-in-progress stays false: we want both builds to
+    # finish, not get killed when a newer tag lands minutes later.
+    # Lives inside the job (not at workflow level) because matrix vars
+    # aren't defined in the workflow scope.
+    concurrency:
+      group: build-mac-${{ matrix.arch }}-${{ github.ref }}
+      cancel-in-progress: false
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     permissions:
