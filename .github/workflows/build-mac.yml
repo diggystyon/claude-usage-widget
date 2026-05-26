@@ -80,6 +80,52 @@ jobs:
         run: |
           xattr -cr "dist/Claude Usage.app"
 
+      # Smoke test before DMG packaging: launch the built .app's binary
+      # for 15s. If the widget crashes during init (bad import, missing
+      # bundled data file, etc.) the process exits before our timer fires
+      # and we surface stdout/stderr/log/crash-reports and fail the build.
+      # We can't validate real Keychain access or live cookie reads here
+      # -- no Claude desktop on a fresh runner -- but launch-time fatal
+      # errors are exactly the class of regression this catches.
+      - name: Smoke test the built .app
+        run: |
+          APP_BIN="dist/Claude Usage.app/Contents/MacOS/Claude Usage"
+          if [ ! -f "$APP_BIN" ]; then
+            echo "::error::No executable at $APP_BIN"
+            ls -la "dist/Claude Usage.app/Contents/MacOS/" 2>&1 || true
+            exit 1
+          fi
+          echo "Launching widget for 15s smoke test..."
+          "$APP_BIN" >app-stdout.log 2>app-stderr.log &
+          PID=$!
+          sleep 15
+          if kill -0 $PID 2>/dev/null; then
+            echo "::notice::Widget alive after 15s (PID=$PID); smoke test passed"
+            kill -TERM $PID 2>/dev/null || true
+            sleep 2
+            kill -KILL $PID 2>/dev/null || true
+          else
+            echo "::error::Widget exited or crashed during the 15s init window"
+            echo "--- app stdout ---"; cat app-stdout.log 2>/dev/null || true
+            echo "--- app stderr ---"; cat app-stderr.log 2>/dev/null || true
+            echo "--- widget log ---"
+            LOG="$HOME/Library/Application Support/ClaudeUsageTray/menubar.log"
+            if [ -f "$LOG" ]; then tail -100 "$LOG"; else echo "(no log)"; fi
+            echo "--- crash reports ---"
+            ls -la "$HOME/Library/Logs/DiagnosticReports/" 2>/dev/null | grep -i claude || echo "(none)"
+            exit 1
+          fi
+          # Surface ERROR lines from the widget log even on success, so
+          # any unexpected init-time failure is visible in the build log.
+          LOG="$HOME/Library/Application Support/ClaudeUsageTray/menubar.log"
+          if [ -f "$LOG" ]; then
+            ERRORS=$(grep -E '\[ERROR\]' "$LOG" || true)
+            if [ -n "$ERRORS" ]; then
+              echo "::warning::Widget log has ERROR lines (some are expected on a runner with no Claude install):"
+              echo "$ERRORS" | head -20
+            fi
+          fi
+
       - name: Install create-dmg
         run: brew install create-dmg
 
