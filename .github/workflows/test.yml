@@ -38,8 +38,9 @@ jobs:
           python -m pip install --upgrade pip
           # Just the deps the tests actually use. We don't need rumps /
           # pystray / pywin32 here because the tests only import the
-          # pure-Python helpers, not the entry scripts.
-          pip install pytest 'cryptography>=42.0.0'
+          # pure-Python helpers, not the entry scripts. httpx is
+          # required because claude_api imports it at module level.
+          pip install pytest 'cryptography>=42.0.0' 'httpx>=0.27.0'
 
       - name: Run pytest
         run: |
