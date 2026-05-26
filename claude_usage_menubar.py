@@ -22,12 +22,13 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import httpx
 import rumps
@@ -51,7 +52,13 @@ CONFIG_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "menubar.log"
 SETUP_MARKER = CONFIG_DIR / "setup_complete"
-ICON_TMP = CONFIG_DIR / "icon_current.png"
+# Two icon paths we alternate between on each render. rumps caches the
+# NSImage by path -- assigning self.icon to the SAME path doesn't always
+# trigger a redraw, so we rotate _ICON_PATHS[0] <-> _ICON_PATHS[1] and
+# rumps sees a "different" path every tick. The .tmp suffix is written
+# first and atomically renamed to the active path via os.replace so a
+# half-written PNG is never observable by rumps.
+_ICON_PATHS = (CONFIG_DIR / "icon_a.png", CONFIG_DIR / "icon_b.png")
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 _log_level = logging.DEBUG if os.environ.get("CLAUDE_USAGE_DEBUG") else logging.INFO
@@ -593,10 +600,21 @@ def _first_launch_setup() -> bool:
 
 class MenuBarApp(rumps.App):
     def __init__(self):
-        self._write_icon(0, 0, None)
+        # Thread-safe queue of UI work items submitted by background
+        # threads. Drained on the AppKit main thread by _drain_ui_queue
+        # (a rumps.timer-decorated method). All actual self.icon /
+        # self.menu mutations happen inside drained callables so we
+        # never touch AppKit from a background thread.
+        self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
+        # Alternates 0 <-> 1 on each icon write; see _ICON_PATHS above.
+        self._icon_counter = 0
+        # Pre-render the initial icon ON THE MAIN THREAD (we're in __init__
+        # before any background threads exist) so the menu bar comes up with
+        # placeholder bars rather than the default rumps icon.
+        initial_icon = self._do_write_icon(0, 0, None)
         super().__init__(
             APP_DISPLAY_NAME,
-            icon=str(ICON_TMP),
+            icon=str(initial_icon),
             title="",
             quit_button=None,
             template=False,
@@ -654,21 +672,72 @@ class MenuBarApp(rumps.App):
         threading.Thread(target=self._status_poll_loop,  daemon=True).start()
         threading.Thread(target=self._update_check_loop, daemon=True).start()
 
-    # ----- icon writing -----
+    # ----- icon + menu (main-thread UI mutation marshaled via _ui_queue) -----
 
-    def _write_icon(self, session_pct: float, weekly_pct: float,
-                    dot: Optional[Tuple[int, int, int]]) -> None:
-        img = render_icon(session_pct, weekly_pct, size=44, status_dot=dot)
+    # AppKit is not thread-safe. The three background loops
+    # (_poll_loop / _status_poll_loop / _update_check_loop) cannot
+    # legally touch self.icon or self.mi_*.title -- they enqueue the
+    # refresh by calling _refresh_icon_and_menu, and the actual mutation
+    # runs on the main thread inside _drain_ui_queue.
+    #
+    # That gives us serialized icon writes (no concurrent PNG corruption
+    # at _ICON_PATHS), serialized menu mutations (no AppKit race), and
+    # at most ~100ms latency between a background event and the user
+    # seeing the new bars -- imperceptible.
+
+    @rumps.timer(0.1)
+    def _drain_ui_queue(self, _) -> None:
+        """Main-thread loop: pop everything off _ui_queue and run it.
+        rumps.timer fires on the run loop, so anything we execute here
+        is guaranteed to be on the AppKit main thread."""
         try:
-            img.save(str(ICON_TMP), format="PNG")
+            while True:
+                fn = self._ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    logging.exception("UI queue work raised")
+        except queue.Empty:
+            pass
+
+    def _do_write_icon(self, session_pct: float, weekly_pct: float,
+                       dot: Optional[Tuple[int, int, int]]) -> Path:
+        """Main-thread only. Renders the icon PNG to a rotating path
+        (icon_a.png <-> icon_b.png) via an atomic .tmp + os.replace, so
+        rumps never sees a half-written file AND always gets a fresh
+        path string (which forces its NSImage cache to invalidate).
+        Returns the active path."""
+        idx = self._icon_counter
+        self._icon_counter = (self._icon_counter + 1) % 2
+        target = _ICON_PATHS[idx]
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        try:
+            img = render_icon(session_pct, weekly_pct, size=44, status_dot=dot)
+            img.save(str(tmp), format="PNG")
+            os.replace(str(tmp), str(target))
         except Exception:
             logging.exception("icon save failed")
+            # If we never got the file written, hand back the OTHER path
+            # (which presumably still has the previous frame).
+            return _ICON_PATHS[(idx + 1) % 2]
+        return target
 
     def _refresh_icon_and_menu(self) -> None:
+        """Background-thread-safe entry point. Enqueues a refresh that
+        actually mutates the UI on the main thread (see
+        _do_refresh_icon_and_menu). The background-to-main marshaling
+        means this is safe to call from _poll_loop, _status_poll_loop,
+        _update_check_loop, or _check_status_once."""
+        self._ui_queue.put(self._do_refresh_icon_and_menu)
+
+    def _do_refresh_icon_and_menu(self) -> None:
+        """Main-thread only. Renders the icon + updates every menu item.
+        Must be called from inside _drain_ui_queue (or __init__, before
+        any background threads exist)."""
         dot = STATUS_COLORS.get(self.claude_status_key, (None, None))[1]
-        self._write_icon(self.session_pct, self.weekly_pct, dot)
+        new_path = self._do_write_icon(self.session_pct, self.weekly_pct, dot)
         try:
-            self.icon = str(ICON_TMP)
+            self.icon = str(new_path)
         except Exception:
             logging.exception("icon reassign failed")
 
