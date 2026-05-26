@@ -16,6 +16,8 @@ Shows your current Claude.ai session and weekly usage as two colored bars in you
 
    Not sure which you have? Apple menu > About This Mac. If "Chip" says M1/M2/M3/M4, pick arm64. If "Processor" says Intel, pick x86_64.
 
+   > **Intel availability note:** the build pipeline produces an x86_64 DMG via a GitHub Actions matrix that depends on the free `macos-13` runner pool, which has been heavily backlogged. If the x86_64 DMG is missing from a given release, the Intel build was still queued at release time. Either wait for a later release, build from source (see "Build from source" below), or open an issue and we'll re-run the Intel build manually.
+
 2. Double-click the `.dmg` file. A window opens showing the app icon and an arrow pointing at the Applications folder.
 3. **Drag the app icon onto the Applications folder shortcut.**
 4. Open the Applications folder and find **Claude Usage**.
