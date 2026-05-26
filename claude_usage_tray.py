@@ -524,9 +524,44 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
     Bound to 127.0.0.1 only -- nothing is exposed to the network. We also
     require an Origin header that begins with chrome-extension:// or
     moz-extension:// so a casually-malicious local app can't push fake
-    values. Note that Origin headers are trivially spoofable by a native
-    local process; a future release will move to a shared-secret design
-    written by the installer and read by the extension on first run.
+    values, and the POST body is hard-capped at MAX_BRIDGE_BODY_BYTES so
+    nothing on the box can OOM us via Content-Length games.
+
+    --- On the spoofable Origin: deliberately NOT fixed ---
+
+    Origin headers are trivially forgeable by any native local process
+    (Chrome enforces them inside the browser; nothing enforces them on
+    the network layer). The v1.2.0 audit flagged this and recommended a
+    shared-secret auth scheme. After thinking about the actual threat
+    model we chose NOT to implement it. Reasoning:
+
+      What an attacker with the spoofed Origin can do:
+        - Push fake usage percentages into the tray icon. That's it.
+
+      What they CANNOT do:
+        - Read the widget's data (bridge is POST-only; no GET endpoints).
+        - Exfiltrate cookies (bridge receives, never sends).
+        - Escalate privileges, run code, or touch the user's claude.ai
+          account in any way.
+
+      And: an attacker who can already POST to 127.0.0.1:38080 with a
+      custom Origin header is by definition running code on the user's
+      box. At that point they have far more direct attack surfaces --
+      reading the Claude desktop app's cookie SQLite, reading this
+      widget's own config.json with stored cookies, sending requests to
+      claude.ai with the user's session directly, etc. Lying to the tray
+      icon is approximately #47 on the threat list.
+
+    When to revisit this decision:
+      - If the bridge ever gains a GET endpoint that returns sensitive
+        data (cookies, session info, anything not the user already has).
+      - If the bridge ever takes an action on the user's behalf (e.g.,
+        a "send message" or "open chat" endpoint).
+      - If the widget is repackaged for a hostile shared environment
+        (workplace kiosks, multi-user lab machines, etc.).
+
+    None of those apply today. Origin check + body cap is the right
+    amount of hygiene for the current threat model.
     """
     tray_app: "Optional[TrayApp]" = None  # set before serve_forever()
 
