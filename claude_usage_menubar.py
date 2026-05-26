@@ -24,7 +24,6 @@ import logging.handlers
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -42,7 +41,7 @@ BUNDLE_NAME = "Claude Usage.app"
 APP_INSTALL_PATH = "/Applications/Claude Usage.app"
 CLAUDE_APP_PATH = "/Applications/Claude.app"
 CLAUDE_DOWNLOAD_URL = "https://claude.ai/download"
-__version__ = "1.1.3"
+__version__ = "1.2.0"
 
 # Update check uses the same GitHub Releases endpoint as the Windows build.
 UPDATE_VERSION_URL  = "https://api.github.com/repos/diggystyon/claude-usage-widget/releases/latest"
@@ -593,8 +592,6 @@ def _first_launch_setup() -> bool:
 # ---------- menu bar app ----------
 
 class MenuBarApp(rumps.App):
-    EXTENSION_FRESHNESS_SEC = 180
-
     def __init__(self):
         self._write_icon(0, 0, None)
         super().__init__(
@@ -839,11 +836,18 @@ class MenuBarApp(rumps.App):
             self.stop_evt.wait(300)
 
     def _update_check_loop(self) -> None:
+        """On startup and once per 24h, check GitHub Releases for a newer
+        version. On failure (network blip, GitHub down, parse error) retry
+        in 1 hour instead of waiting the full 24h, so an early-morning
+        blip doesn't push the next attempt out by a whole day.
+        Toast once per detected new version per session."""
         notified_for: Optional[str] = None
         while not self.stop_evt.is_set():
+            ok = False
             try:
                 latest = fetch_latest_version()
                 if latest:
+                    ok = True
                     self.latest_version = latest
                     if (_parse_version(latest) > _parse_version(__version__)
                             and notified_for != latest):
@@ -856,7 +860,8 @@ class MenuBarApp(rumps.App):
                     self._refresh_icon_and_menu()
             except Exception:
                 logging.exception("update check loop error")
-            self.stop_evt.wait(24 * 3600)
+            # Long wait on success, short retry on failure.
+            self.stop_evt.wait(24 * 3600 if ok else 3600)
 
 
 # ---------- entry point ----------

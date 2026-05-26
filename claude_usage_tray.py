@@ -38,7 +38,7 @@ import cookie_sources
 APP_NAME = "ClaudeUsageTray"
 APP_DISPLAY_NAME = "Claude Usage"
 APP_USER_MODEL_ID = "diggystyon.ClaudeUsageTray"
-__version__ = "1.1.3"  # bump this AND installer.iss "#define AppVersion" together
+__version__ = "1.2.0"  # bump this AND installer.iss "#define AppVersion" together
 
 # --- update-check config (GitHub Releases) ---
 # UPDATE_VERSION_URL hits GitHub's REST API and returns JSON for the latest
@@ -313,30 +313,30 @@ STATUS_COLORS = {
 CLAUDE_STATUS_URL = "https://status.claude.com/"
 
 
-def _status_client() -> Optional[httpx.Client]:
-    """Create an httpx.Client for the status endpoint with three fallback
-    SSL strategies. PyInstaller's bundled ssl/certifi setup can produce a
-    FileNotFoundError when create_default_context() can't find the CA file;
-    we try certifi explicitly, then unverified as a last resort. The status
-    endpoint serves public read-only data so verify=False is acceptable
-    there but NOT for claude.ai cookie traffic."""
-    # Strategy 1: default (works once certifi data is bundled).
-    try:
-        return httpx.Client(timeout=10.0)
-    except Exception as e:
-        logging.warning("status client default SSL setup failed: %s", e)
-    # Strategy 2: pass certifi.where() explicitly.
+def _status_ssl_strategies() -> List[Tuple[str, object]]:
+    """Return a list of (name, verify-arg) tuples to try in order when
+    talking to status.claude.com. PyInstaller's bundled ssl/certifi setup
+    can fail with FileNotFoundError at first request, so we try the
+    default, then certifi explicitly, then unverified as a last resort.
+
+    The status endpoint serves public read-only data so verify=False is
+    acceptable there. We do NOT use this for claude.ai cookie traffic.
+
+    Note: previously this function returned an httpx.Client and the
+    caller cascaded on client construction failures, but the constructor
+    never raises -- SSL errors surface only at first request -- so the
+    fallbacks were unreachable. The cascade is now at the request site.
+    """
+    strategies: List[Tuple[str, object]] = [("default", None)]
     try:
         import certifi
-        return httpx.Client(timeout=10.0, verify=certifi.where())
-    except Exception as e:
-        logging.warning("status client certifi SSL setup failed: %s", e)
-    # Strategy 3: verify=False. Acceptable only for the public status JSON.
-    try:
-        return httpx.Client(timeout=10.0, verify=False)
+        cert_path = certifi.where()
+        if os.path.isfile(cert_path):
+            strategies.append(("certifi", cert_path))
     except Exception:
-        logging.exception("status client unverified setup also failed")
-        return None
+        pass
+    strategies.append(("unverified", False))
+    return strategies
 
 
 def fetch_claude_status() -> Optional[Tuple[str, str]]:
@@ -345,24 +345,48 @@ def fetch_claude_status() -> Optional[Tuple[str, str]]:
     Returns (status_key, label) like ('operational', 'All systems operational')
     or None on any failure (network, parse, missing component).
     Filters to ONLY the claude.ai component, ignoring the API / Console / etc.
+
+    Tries the SSL strategies in _status_ssl_strategies() in order, falling
+    through on SSL or transport failures so a missing CA bundle doesn't
+    leave the status dot stuck on its last known value forever.
     """
-    client = _status_client()
-    if client is None:
+    url = "https://status.claude.com/api/v2/components.json"
+    data = None
+    last_err: Optional[Exception] = None
+    for name, verify in _status_ssl_strategies():
+        try:
+            kwargs: Dict[str, object] = {"timeout": 10.0}
+            if verify is not None:
+                kwargs["verify"] = verify
+            with httpx.Client(**kwargs) as c:  # type: ignore[arg-type]
+                r = c.get(url)
+                if r.status_code != 200:
+                    return None
+                data = r.json()
+            if name != "default":
+                logging.warning("status fetch succeeded via SSL fallback %r", name)
+            break
+        except (httpx.TransportError, FileNotFoundError, OSError, ImportError) as e:
+            last_err = e
+            logging.debug("status fetch via %s failed: %s", name, e)
+            continue
+        except Exception:
+            logging.exception("status fetch via %s raised", name)
+            return None
+    if data is None:
+        if last_err is not None:
+            logging.warning("status fetch failed across all SSL strategies: %s",
+                            last_err)
         return None
     try:
-        with client as c:
-            r = c.get("https://status.claude.com/api/v2/components.json")
-            if r.status_code != 200:
-                return None
-            data = r.json()
         for c in data.get("components", []):
-            name = (c.get("name") or "").strip().lower()
-            if name == "claude.ai":
+            comp_name = (c.get("name") or "").strip().lower()
+            if comp_name == "claude.ai":
                 key = c.get("status") or "operational"
                 label = STATUS_COLORS.get(key, (key.replace("_", " ").title(), None))[0]
                 return (key, label)
     except Exception:
-        logging.exception("status fetch failed")
+        logging.exception("status parse failed")
     return None
 
 
@@ -754,6 +778,12 @@ class ActivityWatcher(threading.Thread):
 # ---------- localhost listener for the browser extension ----------
 
 BRIDGE_PORT = 38080
+# Hard cap on POST body size. The legitimate extension payload is a small
+# JSON object (well under 4 KiB). Anything larger is either a bug or a
+# malicious local app trying to OOM us by setting an oversized
+# Content-Length and streaming. 64 KiB leaves plenty of headroom for the
+# real payload and any future expansion without exposing us to abuse.
+MAX_BRIDGE_BODY_BYTES = 64 * 1024
 
 
 class _BridgeHandler(http.server.BaseHTTPRequestHandler):
@@ -761,7 +791,10 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
 
     Bound to 127.0.0.1 only -- nothing is exposed to the network. We also
     require an Origin header that begins with chrome-extension:// or
-    moz-extension:// so a malicious local app can't push fake values.
+    moz-extension:// so a casually-malicious local app can't push fake
+    values. Note that Origin headers are trivially spoofable by a native
+    local process; a future release will move to a shared-secret design
+    written by the installer and read by the extension on first run.
     """
     tray_app: "Optional[TrayApp]" = None  # set before serve_forever()
 
@@ -787,11 +820,28 @@ class _BridgeHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers(); return
         if not self._accept_origin():
             self.send_response(403); self.end_headers(); return
+        # Validate Content-Length BEFORE reading the body. Reject negative,
+        # malformed, or oversized lengths so we don't cooperate with an
+        # attacker's allocation request.
         try:
             length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            self.send_response(400); self.end_headers(); return
+        if length < 0 or length > MAX_BRIDGE_BODY_BYTES:
+            self.send_response(413); self.end_headers(); return
+        # Be strict about Content-Type for any non-empty body -- the legit
+        # extension always sends application/json.
+        if length > 0:
+            ctype = (self.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
+            if ctype and ctype != "application/json":
+                self.send_response(415); self.end_headers(); return
+        try:
             body = self.rfile.read(length) if length else b""
             data = json.loads(body.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self.send_response(400); self.end_headers(); return
         except Exception:
+            logging.exception("bridge handler body read failed")
             self.send_response(400); self.end_headers(); return
         try:
             if self.__class__.tray_app is not None:
@@ -892,22 +942,28 @@ class TrayApp:
             logging.exception("open status page failed")
 
     def action_check_updates(self, icon, item) -> None:
-        """Open the OneDrive download folder. (Always available even when
-        no newer version has been detected, so users can grab the current
-        installer to share with friends.)"""
+        """Open the GitHub Releases page in the user's default browser so
+        they can grab the latest installer. Always available even when no
+        newer version has been detected, so users can share the current
+        installer with friends."""
         try:
             os.startfile(UPDATE_DOWNLOAD_URL)
         except Exception:
-            logging.exception("open download folder failed")
+            logging.exception("open releases page failed")
 
     def _update_check_loop(self) -> None:
-        """On startup and once per 24h, check the configured version URL.
-        Toast once when an update is first detected per session."""
+        """On startup and once per 24h, check GitHub Releases for a newer
+        version. On failure (network blip, GitHub down, parse error) retry
+        in 1 hour instead of waiting the full 24h, so an early-morning
+        blip doesn't push the next attempt out by a whole day.
+        Toast once per detected new version per session."""
         notified_for: Optional[str] = None
         while not self.stop_evt.is_set():
+            ok = False
             try:
                 latest = fetch_latest_version()
                 if latest:
+                    ok = True
                     self.latest_version = latest
                     if (_parse_version(latest) > _parse_version(__version__)
                             and notified_for != latest):
@@ -922,7 +978,8 @@ class TrayApp:
                     self._refresh_icon()
             except Exception:
                 logging.exception("update_check_loop error")
-            self.stop_evt.wait(24 * 3600)
+            # Long wait on success, short retry on failure.
+            self.stop_evt.wait(24 * 3600 if ok else 3600)
 
     def _tooltip(self):
         # Windows caps tray tooltips at 128 characters via Shell_NotifyIcon's
@@ -1251,9 +1308,13 @@ class TrayApp:
         return (time.time() - self.last_extension_push_at) < self.EXTENSION_FRESHNESS_SEC
 
     def _tooltip_tick_loop(self) -> None:
-        """Refresh the tooltip every ~10s so the 'Xs ago' counter keeps moving."""
+        """Refresh the tooltip every ~10s so the 'Xs ago' counter keeps
+        moving while the browser extension is the active source. Skips
+        the work when the source isn't the extension (manual paste
+        tooltips don't need re-rendering between fetches)."""
         while not self.stop_evt.is_set():
-            if self.icon is not None and self.last_extension_push_at > 0:
+            if (self.icon is not None
+                    and self.config.get("last_source") == "Claude browser extension"):
                 try:
                     self.icon.title = self._tooltip()
                 except Exception:
@@ -1264,21 +1325,32 @@ class TrayApp:
         """Wait for Windows to materialize the NotifyIconSettings entry,
         then promote it. Retry up to 3 times 5s apart since the entry can
         take a moment to appear after Shell_NotifyIcon NIM_ADD. Stops on
-        first successful promotion (or if entry was already promoted).
+        the first pass that actually flipped IsPromoted, so a healthy
+        install doesn't burn three log entries when one would do.
 
         Mid-session promotion does not actually move an already-registered
         icon to the visible tray; the value sticks for next launch. The
         installer's orphan-only cleanup ensures that next-launch state
-        survives upgrades."""
+        survives upgrades.
+
+        Note: a zero return from _promote_tray_icon() means either 'entry
+        not yet present' or 'entry already promoted' (the function
+        doesn't distinguish). Retries cover the slow-NIM_ADD case; a
+        machine where the entry is already promoted just sees three
+        debug-level passes that find nothing to do."""
         for attempt in range(3):
             self.stop_evt.wait(5)
             if self.stop_evt.is_set():
                 return
             try:
                 # Idempotent: extra runs see IsPromoted=1 and skip writes.
-                _promote_tray_icon()
+                promoted = _promote_tray_icon()
             except Exception:
                 logging.exception("promote_tray_icon failed")
+                continue
+            if promoted > 0:
+                # First pass that actually fixed something; no need to retry.
+                return
 
     def run(self):
         threading.Thread(target=self._poll_loop, daemon=True).start()

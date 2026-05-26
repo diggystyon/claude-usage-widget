@@ -3,7 +3,7 @@
 ; Output: installer_dist\Claude Usage Setup.exe
 
 #define AppName       "Claude Usage"
-#define AppVersion    "1.1.3"
+#define AppVersion    "1.2.0"
 #define AppPublisher  "diggystyon"
 #define AppExeName    "Claude Usage.exe"
 #define AppId         "{{C61D6A7B-9E0E-4C2C-9F2A-CLAUDEUSAGE001}"
@@ -85,10 +85,15 @@ function ExpandEnvVars(const s: String): String;
   values that Inno Setup's RegQueryStringValue returns unexpanded. We only
   care about the variables Windows uses for tray-icon ExecutablePath
   storage, which in practice is dominated by %LOCALAPPDATA% (since we
-  install there). Other vars covered for safety. }
+  install there). Other vars covered for safety.
+
+  Tries three casings of each placeholder (canonical / upper / lower)
+  because StringChangeEx is case-sensitive and the registry doesn't
+  promise canonical casing across users' machines. }
 var
-  i: Integer;
+  i, j: Integer;
   vars: array[0..6] of String;
+  casings: array[0..2] of String;
   v: String;
 begin
   Result := s;
@@ -103,24 +108,31 @@ begin
   begin
     v := GetEnv(vars[i]);
     if v <> '' then
-      StringChangeEx(Result, '%' + vars[i] + '%', v, True);
+    begin
+      casings[0] := vars[i];
+      casings[1] := UpperCase(vars[i]);
+      casings[2] := LowerCase(vars[i]);
+      for j := 0 to 2 do
+        StringChangeEx(Result, '%' + casings[j] + '%', v, True);
+    end;
   end;
 end;
 
 procedure CleanupOldTrayIcons();
 { Walks HKCU:\Control Panel\NotifyIconSettings and removes ONLY entries
-  whose ExecutablePath points to a file that no longer exists on disk.
-  This cleans up orphan entries from previous installs at moved or
-  uninstalled paths, while preserving the user's pinned-state toggle on
-  the current install (its file is on disk by the time this runs).
+  whose ExecutablePath BOTH:
+   (a) names a file that no longer exists on disk, AND
+   (b) belongs to a Claude Usage install (basename matches {#AppExeName}).
 
-  Phase 1 of the tray-pinning fix: don't touch active entries, so a single
-  manual "always visible" pin survives all future upgrades. }
+  Filter (a) preserves the active install's pinned-state toggle on
+  upgrades. Filter (b) keeps us from sweeping orphan tray entries that
+  belong to unrelated apps the user has uninstalled -- a Claude Usage
+  installer should clean up after Claude Usage, not the rest of the system. }
 var
   rootPath: String;
   subkeys: TArrayOfString;
   i: Integer;
-  ep, expanded: String;
+  ep, expanded, basename: String;
   removed: Integer;
 begin
   rootPath := 'Control Panel\NotifyIconSettings';
@@ -135,7 +147,9 @@ begin
       if ep <> '' then
       begin
         expanded := ExpandEnvVars(ep);
-        if not FileExists(expanded) then
+        basename := ExtractFileName(expanded);
+        if (CompareText(basename, '{#AppExeName}') = 0)
+           and not FileExists(expanded) then
         begin
           if RegDeleteKeyIncludingSubkeys(HKEY_CURRENT_USER,
                                            rootPath + '\' + subkeys[i]) then
@@ -144,7 +158,8 @@ begin
       end;
     end;
   end;
-  Log(Format('CleanupOldTrayIcons: removed %d orphan entries', [removed]));
+  Log(Format('CleanupOldTrayIcons: removed %d Claude Usage orphan entries',
+             [removed]));
 end;
 
 

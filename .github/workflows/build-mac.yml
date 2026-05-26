@@ -3,15 +3,25 @@ name: Build Mac
 # Runs on every tag push matching v*.*.* and also on a manual button click.
 # Produces a Claude Usage.dmg attached to the GitHub release for tag pushes,
 # and as a downloadable build artifact for manual runs.
+#
+# Note: macos-latest currently resolves to an Apple-Silicon runner, so the
+# DMG produced here is ARM64-only. Intel Macs will see "this app is not
+# supported on your Mac" unless we add an Intel runner to a matrix and lipo
+# the two binaries together. README-MAC documents the current limitation.
 on:
   push:
     tags:
       - 'v*.*.*'
   workflow_dispatch:
 
+concurrency:
+  group: build-mac
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: macos-latest
+    timeout-minutes: 20
     permissions:
       contents: write   # needed for upload to release
     steps:
@@ -22,15 +32,21 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements-mac.txt
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
+          # Pin PyInstaller's major to keep --collect-data semantics stable.
+          pip install "pyinstaller>=6.10,<7.0"
           if [ -f requirements-mac.txt ]; then
             pip install -r requirements-mac.txt
           else
             echo "::warning::requirements-mac.txt not found yet -- using fallback list"
-            pip install rumps httpx Pillow pync pyinstaller
+            # pync intentionally dropped from the fallback list: we use
+            # /usr/bin/osascript for notifications.
+            pip install rumps httpx Pillow cryptography
           fi
 
       - name: Generate icons
@@ -56,6 +72,7 @@ jobs:
             --icon app.icns \
             --osx-bundle-identifier com.diggystyon.claudeusage \
             --collect-data certifi \
+            --collect-submodules cryptography \
             --noconfirm \
             claude_usage_menubar.py
 
@@ -74,6 +91,9 @@ jobs:
           if [ -f dmg_bg.png ]; then
             BG_ARG="--background dmg_bg.png"
           fi
+          # create-dmg returns non-zero on cosmetic issues even when the DMG
+          # is fine. We still verify the file exists below so a truly broken
+          # run fails loudly rather than silently producing a half-DMG.
           create-dmg \
             --volname "Claude Usage" \
             --window-pos 200 120 \
@@ -87,8 +107,6 @@ jobs:
             "Claude Usage.dmg" \
             "dist/Claude Usage.app" \
             || true
-          # create-dmg sometimes returns non-zero on cosmetic issues even when
-          # the DMG is fine; verify the file exists.
           test -f "Claude Usage.dmg"
 
       - name: Upload as artifact (for manual runs)
@@ -97,8 +115,10 @@ jobs:
           name: Claude-Usage-DMG
           path: Claude Usage.dmg
 
+      # Third-party Action pinned to a specific patch version. Pin to SHA
+      # if/when you want maximum supply-chain hygiene.
       - name: Attach DMG to release (for tag pushes)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.1.0
         with:
           files: Claude Usage.dmg

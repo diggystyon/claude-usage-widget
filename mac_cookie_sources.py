@@ -147,12 +147,19 @@ def _decrypt_aes128_cbc(ciphertext: bytes, key: bytes) -> Optional[str]:
         cipher = Cipher(algorithms.AES(key), modes.CBC(b" " * 16))
         dec = cipher.decryptor()
         plain = dec.update(body) + dec.finalize()
-        # PKCS#7 padding strip.
+        # PKCS#7 padding strip with strict validation. A valid PKCS#7
+        # block ends with N copies of the byte N (1 <= N <= 16). If the
+        # padding doesn't validate, the ciphertext or key is wrong and
+        # the "plaintext" is just garbage -- better to return None than
+        # cache a corrupted cookie value the API will then reject.
         if not plain:
             return None
         pad = plain[-1]
-        if 1 <= pad <= 16:
-            plain = plain[:-pad]
+        if not (1 <= pad <= 16) or len(plain) < pad:
+            return None
+        if plain[-pad:] != bytes([pad]) * pad:
+            return None
+        plain = plain[:-pad]
         return plain.decode("utf-8", errors="replace")
     except Exception:
         logging.exception("decrypt failed")
@@ -227,8 +234,17 @@ def fetch_cookies() -> Optional[Tuple[str, Dict[str, str], str]]:
     # First try without the key -- many cookies are stored plaintext on
     # macOS (only the sensitive ones like sessionKey are encrypted).
     cookies = _read_cookies_db(db, key=None)
-    have_session = any(n.lower().endswith("sessionkey") or n.lower() == "sessionkey"
-                       for n in cookies)
+    # Require a sessionKey that's also a plausible length -- a real
+    # claude.ai sessionKey is a long opaque token (hundreds of chars).
+    # If the value is present but tiny, the plaintext read picked up a
+    # stale or corrupted entry; fall through to the keychain decrypt
+    # path so we get the real value.
+    have_session = any(
+        (n.lower() == "sessionkey" or n.lower().endswith("sessionkey"))
+        and isinstance(cookies.get(n), str)
+        and len(cookies[n]) >= 20
+        for n in cookies
+    )
     if not have_session:
         # Need the keychain password to decrypt sessionKey.
         pw = _keychain_password()
