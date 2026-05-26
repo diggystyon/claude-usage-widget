@@ -35,19 +35,34 @@ from PIL import Image, ImageDraw
 
 import cookie_sources
 from _version import __version__  # single source of truth -- bump _version.py only
+from claude_api import (
+    ClaudeUsageFetcher,
+    CLAUDE_STATUS_URL,
+    STATUS_COLORS,
+    UPDATE_DOWNLOAD_URL,
+    _parse_version,
+    _setup_bundled_certifi,
+    fetch_claude_status,
+    fetch_latest_version,
+)
 
 APP_NAME = "ClaudeUsageTray"
 APP_DISPLAY_NAME = "Claude Usage"
 APP_USER_MODEL_ID = "diggystyon.ClaudeUsageTray"
 
-# --- update-check config (GitHub Releases) ---
-# UPDATE_VERSION_URL hits GitHub's REST API and returns JSON for the latest
-# release; we read tag_name (e.g. "v1.1.0") and strip the leading 'v'.
-# UPDATE_DOWNLOAD_URL is the human-facing release page where the user can
-# grab the .exe asset. Both endpoints are anonymous-accessible for public
-# repos and need no auth or rate-limit headers for our 1-call-per-day usage.
-UPDATE_VERSION_URL  = "https://api.github.com/repos/diggystyon/claude-usage-widget/releases/latest"
-UPDATE_DOWNLOAD_URL = "https://github.com/diggystyon/claude-usage-widget/releases/latest"
+# UA the widget identifies as when calling GitHub's Releases API. GitHub
+# requires a User-Agent on API requests; the version string lets future
+# server-side telemetry distinguish old clients from new.
+_GITHUB_API_UA = f"claude-usage-widget/{__version__} (windows)"
+
+# Fallback UA for the claude.ai usage API when the cURL-paste path
+# didn't capture one (older cURL exports, or the user pasted without
+# --user-agent). cookie_sources.UA_DESKTOP is preferred when available;
+# this is the safety net.
+_DEFAULT_WINDOWS_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home() / ".config"))) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "tray.log"
@@ -77,46 +92,7 @@ def _set_app_user_model_id() -> None:
         logging.exception("could not set AppUserModelID")
 
 
-def _setup_bundled_certifi() -> None:
-    """Make TLS verification work inside the PyInstaller bundle.
-
-    PyInstaller's --collect-data certifi flag copies cacert.pem into the bundle,
-    but at runtime certifi.where() can still return a path that doesn't resolve
-    (depending on how the runtime hook fires). When that happens, httpx defaults
-    fail with [Errno 2] and we silently slide to verify=False. To prevent that,
-    we explicitly point SSL_CERT_FILE / REQUESTS_CA_BUNDLE at a real on-disk
-    cacert.pem before any httpx.Client is constructed.
-
-    Search order:
-      1. respect an explicit SSL_CERT_FILE the user already set
-      2. certifi.where() if the file exists
-      3. {sys._MEIPASS}/certifi/cacert.pem (PyInstaller --onefile extraction dir)
-      4. {bundle dir}/certifi/cacert.pem (PyInstaller --onedir, or Mac .app)
-    """
-    try:
-        if os.environ.get("SSL_CERT_FILE") and os.path.isfile(os.environ["SSL_CERT_FILE"]):
-            return
-        candidates: List[str] = []
-        try:
-            import certifi
-            candidates.append(certifi.where())
-        except Exception:
-            pass
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            candidates.append(os.path.join(meipass, "certifi", "cacert.pem"))
-        # PyInstaller --onedir: data sits next to the executable.
-        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-        candidates.append(os.path.join(exe_dir, "certifi", "cacert.pem"))
-        for path in candidates:
-            if path and os.path.isfile(path):
-                os.environ["SSL_CERT_FILE"] = path
-                os.environ["REQUESTS_CA_BUNDLE"] = path
-                logging.info("TLS CA bundle: %s", path)
-                return
-        logging.warning("no CA bundle found; httpx will fall back to verify=False")
-    except Exception:
-        logging.exception("certifi bundle setup failed")
+# _setup_bundled_certifi lives in claude_api.py (imported above).
 
 
 _setup_bundled_certifi()
@@ -299,111 +275,8 @@ def render_icon(session_pct: float, weekly_pct: float, size: int = 64,
     return img
 
 
-# ---------- Claude status page integration ----------
-
-# Maps Statuspage component statuses to (display label, dot RGB).
-# operational has no dot (dot suppressed when icon overlay color is None).
-STATUS_COLORS = {
-    "operational":          ("All systems operational", None),
-    "degraded_performance": ("Degraded performance",    (255, 200, 0)),    # yellow
-    "partial_outage":       ("Partial outage",          (255, 140, 0)),    # orange
-    "major_outage":         ("Major outage",            (235, 60, 60)),    # red
-    "under_maintenance":    ("Under maintenance",       (80, 140, 220)),   # blue
-}
-CLAUDE_STATUS_URL = "https://status.claude.com/"
-
-
-def _status_ssl_strategies() -> List[Tuple[str, object]]:
-    """Return a list of (name, verify-arg) tuples to try in order when
-    talking to status.claude.com. PyInstaller's bundled ssl/certifi setup
-    can fail with FileNotFoundError at first request, so we try the
-    default, then certifi explicitly, then unverified as a last resort.
-
-    The status endpoint serves public read-only data so verify=False is
-    acceptable there. We do NOT use this for claude.ai cookie traffic.
-
-    Note: previously this function returned an httpx.Client and the
-    caller cascaded on client construction failures, but the constructor
-    never raises -- SSL errors surface only at first request -- so the
-    fallbacks were unreachable. The cascade is now at the request site.
-    """
-    strategies: List[Tuple[str, object]] = [("default", None)]
-    try:
-        import certifi
-        cert_path = certifi.where()
-        if os.path.isfile(cert_path):
-            strategies.append(("certifi", cert_path))
-    except Exception:
-        pass
-    strategies.append(("unverified", False))
-    return strategies
-
-
-def fetch_claude_status() -> Optional[Tuple[str, str]]:
-    """Fetch the current 'claude.ai' component status from status.claude.com.
-
-    Returns (status_key, label) like ('operational', 'All systems operational')
-    or None on any failure (network, parse, missing component).
-    Filters to ONLY the claude.ai component, ignoring the API / Console / etc.
-
-    Tries the SSL strategies in _status_ssl_strategies() in order, falling
-    through on SSL or transport failures so a missing CA bundle doesn't
-    leave the status dot stuck on its last known value forever.
-    """
-    url = "https://status.claude.com/api/v2/components.json"
-    data = None
-    last_err: Optional[Exception] = None
-    for name, verify in _status_ssl_strategies():
-        try:
-            kwargs: Dict[str, object] = {"timeout": 10.0}
-            if verify is not None:
-                kwargs["verify"] = verify
-            with httpx.Client(**kwargs) as c:  # type: ignore[arg-type]
-                r = c.get(url)
-                if r.status_code != 200:
-                    return None
-                data = r.json()
-            if name != "default":
-                logging.warning("status fetch succeeded via SSL fallback %r", name)
-            break
-        except (httpx.TransportError, FileNotFoundError, OSError, ImportError) as e:
-            last_err = e
-            logging.debug("status fetch via %s failed: %s", name, e)
-            continue
-        except Exception:
-            logging.exception("status fetch via %s raised", name)
-            return None
-    if data is None:
-        if last_err is not None:
-            logging.warning("status fetch failed across all SSL strategies: %s",
-                            last_err)
-        return None
-    try:
-        for c in data.get("components", []):
-            comp_name = (c.get("name") or "").strip().lower()
-            if comp_name == "claude.ai":
-                key = c.get("status") or "operational"
-                label = STATUS_COLORS.get(key, (key.replace("_", " ").title(), None))[0]
-                return (key, label)
-    except Exception:
-        logging.exception("status parse failed")
-    return None
-
-
-# ---------- version / update check ----------
-
-def _parse_version(s: str) -> Tuple[int, ...]:
-    """Parse '1.2.3' (or 'v1.2.3') to (1,2,3). Non-numeric parts become 0.
-    Empty -> (0,)."""
-    s = (s or "").strip().lstrip("vV")
-    s = s.split()[0] if s else ""
-    out = []
-    for piece in s.split("."):
-        try:
-            out.append(int("".join(ch for ch in piece if ch.isdigit())))
-        except ValueError:
-            out.append(0)
-    return tuple(out) if out else (0,)
+# STATUS_COLORS, CLAUDE_STATUS_URL, fetch_claude_status, _parse_version
+# all live in claude_api.py (imported at the top).
 
 
 def _promote_tray_icon() -> int:
@@ -509,33 +382,7 @@ def _promote_tray_icon() -> int:
     return promoted
 
 
-def fetch_latest_version() -> Optional[str]:
-    """Fetch the latest release tag from GitHub. Returns just the version
-    string (e.g. '1.1.0', without leading 'v') or None on failure."""
-    if not UPDATE_VERSION_URL:
-        return None
-    try:
-        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
-            r = client.get(
-                UPDATE_VERSION_URL,
-                headers={
-                    "Accept": "application/vnd.github+json",
-                    # GitHub asks for a User-Agent on API requests:
-                    "User-Agent": f"claude-usage-widget/{__version__}",
-                },
-            )
-        if r.status_code != 200:
-            logging.info("update check: HTTP %s from %s", r.status_code, UPDATE_VERSION_URL)
-            return None
-        data = r.json()
-        # Skip drafts and pre-releases (defensive; releases/latest already filters).
-        if data.get("draft") or data.get("prerelease"):
-            return None
-        tag = data.get("tag_name") or ""
-        return tag.lstrip("vV") or None
-    except Exception:
-        logging.exception("update check failed")
-    return None
+# fetch_latest_version lives in claude_api.py; call sites pass _GITHUB_API_UA.
 
 
 # ---------- toast notifications ----------
@@ -564,125 +411,10 @@ def show_toast(title: str, msg: str) -> None:
 
 # ---------- claude.ai usage fetcher ----------
 
-class ClaudeUsageFetcher:
-    BASE = "https://claude.ai"
-    USAGE_PATH = "/api/organizations/{org}/usage"
-    DEFAULT_UA = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-    SESSION_KEYS = ("five_hour", "current_session", "session")
-    WEEKLY_KEYS = ("seven_day", "weekly", "week")
-
-    def __init__(self, cookies, user_agent="", extra_headers=None, org_id=""):
-        self.cookies = dict(cookies or {})
-        self.org_id = (org_id or "").strip()
-        ua = user_agent or self.DEFAULT_UA
-        headers = {
-            "User-Agent": ua,
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Origin": "https://claude.ai",
-            "Referer": "https://claude.ai/settings/billing",
-            "sec-ch-ua": '"Chromium";v="124", "Not-A.Brand";v="99"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-        }
-        for k, v in (extra_headers or {}).items():
-            if k.lower() in ("cookie", "host", "content-length"):
-                continue
-            headers[k] = v
-        self.client = httpx.Client(headers=headers, cookies=self.cookies, timeout=20.0, follow_redirects=True)
-
-    def close(self):
-        try: self.client.close()
-        except Exception: pass
-
-    def discover_org_id(self):
-        try:
-            r = self.client.get(f"{self.BASE}/api/organizations")
-            if r.status_code != 200:
-                logging.warning("/api/organizations -> %s", r.status_code)
-                return None
-            data = r.json()
-            if isinstance(data, list) and data:
-                first = data[0]
-                org_id = first.get("uuid") or first.get("id")
-                if isinstance(org_id, str):
-                    return org_id
-        except Exception:
-            logging.exception("discover_org_id error")
-        return None
-
-    def fetch(self):
-        if not self.cookies:
-            return None
-        if not self.org_id:
-            self.org_id = self.discover_org_id() or ""
-            if not self.org_id:
-                logging.warning("Could not determine org_id - cookies may be invalid")
-                return None
-        url = self.BASE + self.USAGE_PATH.format(org=self.org_id)
-        try:
-            r = self.client.get(url)
-        except Exception:
-            logging.exception("usage request error")
-            return None
-        if r.status_code != 200:
-            logging.info("usage endpoint -> %s body=%s", r.status_code, r.text[:300].replace("\n", " "))
-            return None
-        try:
-            data = r.json()
-        except Exception:
-            logging.exception("usage response not JSON: %s", r.text[:300])
-            return None
-        return self._extract_percents(data)
-
-    @classmethod
-    def _extract_percents(cls, data):
-        """Return (session_pct, weekly_pct, session_resets_at, weekly_resets_at)
-        on success, or None. The reset strings are raw ISO 8601 from the API
-        (or '' if absent)."""
-        def to_pct(v):
-            try: f = float(v)
-            except (TypeError, ValueError): return None
-            # Claude.ai's API always reports utilization on a 0-100 scale
-            # (e.g. 52.0 means 52%). Don't try to interpret < 1.0 as a
-            # fraction -- that produces a false 100% for 1% real usage.
-            if 0 <= f <= 100.0:
-                return f
-            return None
-        s = w = None
-        s_reset = w_reset = ""
-        if isinstance(data, dict):
-            for k in cls.SESSION_KEYS:
-                v = data.get(k)
-                if isinstance(v, dict) and "utilization" in v:
-                    p = to_pct(v["utilization"])
-                    if p is not None:
-                        s = p
-                        r = v.get("resets_at")
-                        if isinstance(r, str):
-                            s_reset = r
-                        break
-            for k in cls.WEEKLY_KEYS:
-                v = data.get(k)
-                if isinstance(v, dict) and "utilization" in v:
-                    p = to_pct(v["utilization"])
-                    if p is not None:
-                        w = p
-                        r = v.get("resets_at")
-                        if isinstance(r, str):
-                            w_reset = r
-                        break
-        if s is None or w is None:
-            logging.warning("extract_percents incomplete: session=%s weekly=%s", s, w)
-            return None
-        logging.debug("usage parsed: session=%.1f weekly=%.1f", s, w)
-        return (s, w, s_reset, w_reset)
+# ClaudeUsageFetcher lives in claude_api.py. Windows construction sites
+# pass platform="Windows" and the standard Windows UA. The cURL-paste
+# fallback path also passes extra_headers for the user's exotic browser
+# headers.
 
 
 # ---------- activity watcher ----------
@@ -961,7 +693,7 @@ class TrayApp:
         while not self.stop_evt.is_set():
             ok = False
             try:
-                latest = fetch_latest_version()
+                latest = fetch_latest_version(_GITHUB_API_UA)
                 if latest:
                     ok = True
                     self.latest_version = latest
@@ -1050,7 +782,8 @@ class TrayApp:
                 return (
                     ClaudeUsageFetcher(
                         cookies=cookies, user_agent=ua,
-                        extra_headers={}, org_id=self.config.get("org_id", ""),
+                        platform="Windows", extra_headers={},
+                        org_id=self.config.get("org_id", ""),
                     ),
                     source_label,
                 )
@@ -1060,10 +793,15 @@ class TrayApp:
             cookies = {"sessionKey": self.config["session_cookie"]}
         if not cookies:
             return (None, "")
+        # The user pasted cURL: use the User-Agent THEY had (preserves
+        # any A/B segment claude.ai serves their browser) and forward
+        # the extra headers from their original request.
         return (
             ClaudeUsageFetcher(
                 cookies=cookies,
-                user_agent=self.config.get("user_agent", ""),
+                user_agent=(self.config.get("user_agent")
+                            or _DEFAULT_WINDOWS_UA),
+                platform="Windows",
                 extra_headers=self.config.get("extra_headers") or {},
                 org_id=self.config.get("org_id", ""),
             ),

@@ -36,6 +36,16 @@ from PIL import Image, ImageDraw
 
 import mac_cookie_sources
 from _version import __version__  # single source of truth -- bump _version.py only
+from claude_api import (
+    ClaudeUsageFetcher,
+    CLAUDE_STATUS_URL,
+    STATUS_COLORS,
+    UPDATE_DOWNLOAD_URL,
+    _parse_version,
+    _setup_bundled_certifi,
+    fetch_claude_status,
+    fetch_latest_version,
+)
 
 APP_NAME = "ClaudeUsageTray"
 APP_DISPLAY_NAME = "Claude Usage"
@@ -44,9 +54,8 @@ APP_INSTALL_PATH = "/Applications/Claude Usage.app"
 CLAUDE_APP_PATH = "/Applications/Claude.app"
 CLAUDE_DOWNLOAD_URL = "https://claude.ai/download"
 
-# Update check uses the same GitHub Releases endpoint as the Windows build.
-UPDATE_VERSION_URL  = "https://api.github.com/repos/diggystyon/claude-usage-widget/releases/latest"
-UPDATE_DOWNLOAD_URL = "https://github.com/diggystyon/claude-usage-widget/releases/latest"
+# UA the widget identifies as when calling GitHub's Releases API.
+_GITHUB_API_UA = f"claude-usage-widget/{__version__} (macos)"
 
 CONFIG_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -72,50 +81,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-def _setup_bundled_certifi() -> None:
-    """Make TLS verification work inside the PyInstaller .app bundle.
-
-    PyInstaller's --collect-data certifi flag copies cacert.pem into the
-    bundle, but at runtime certifi.where() can still return a path that
-    doesn't resolve. When that happens, httpx defaults fail with [Errno 2]
-    and we silently slide to verify=False. Point SSL_CERT_FILE at a real
-    on-disk cacert.pem before any httpx.Client is constructed.
-
-    Search order:
-      1. respect an explicit SSL_CERT_FILE the user already set
-      2. certifi.where() if the file exists
-      3. {sys._MEIPASS}/certifi/cacert.pem (PyInstaller --onefile)
-      4. {Contents/Resources}/certifi/cacert.pem (.app bundle layout)
-      5. {bundle dir}/certifi/cacert.pem (PyInstaller --onedir)
-    """
-    try:
-        if os.environ.get("SSL_CERT_FILE") and os.path.isfile(os.environ["SSL_CERT_FILE"]):
-            return
-        candidates: List[str] = []
-        try:
-            import certifi
-            candidates.append(certifi.where())
-        except Exception:
-            pass
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            candidates.append(os.path.join(meipass, "certifi", "cacert.pem"))
-        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-        # macOS .app layout: Contents/MacOS/Claude Usage -> ../Resources/certifi
-        candidates.append(os.path.join(exe_dir, "..", "Resources", "certifi", "cacert.pem"))
-        candidates.append(os.path.join(exe_dir, "certifi", "cacert.pem"))
-        for path in candidates:
-            if not path:
-                continue
-            resolved = os.path.normpath(path)
-            if os.path.isfile(resolved):
-                os.environ["SSL_CERT_FILE"] = resolved
-                os.environ["REQUESTS_CA_BUNDLE"] = resolved
-                logging.info("TLS CA bundle: %s", resolved)
-                return
-        logging.warning("no CA bundle found; httpx will fall back to verify=False")
-    except Exception:
-        logging.exception("certifi bundle setup failed")
+# _setup_bundled_certifi lives in claude_api.py (imported above).
 
 
 _setup_bundled_certifi()
@@ -237,97 +203,12 @@ def render_icon(session_pct: float, weekly_pct: float, size: int = 44,
     return img
 
 
-# ---------- claude.ai status integration ----------
-
-STATUS_COLORS = {
-    "operational":          ("All systems operational", None),
-    "degraded_performance": ("Degraded performance",    (255, 200, 0)),
-    "partial_outage":       ("Partial outage",          (255, 140, 0)),
-    "major_outage":         ("Major outage",            (235, 60, 60)),
-    "under_maintenance":    ("Under maintenance",       (80, 140, 220)),
-}
-CLAUDE_STATUS_URL = "https://status.claude.com/"
-
-
-def _status_client() -> Optional[httpx.Client]:
-    """Three-strategy SSL setup for the status endpoint. PyInstaller bundles
-    can fail to find certifi's CA file from a plain ssl.create_default_context
-    call; we fall back to certifi explicitly, then verify=False as a last
-    resort. Public read-only endpoint, so verify=False is acceptable here."""
-    try:
-        return httpx.Client(timeout=10.0)
-    except Exception as e:
-        logging.warning("status client default SSL setup failed: %s", e)
-    try:
-        import certifi
-        return httpx.Client(timeout=10.0, verify=certifi.where())
-    except Exception as e:
-        logging.warning("status client certifi SSL setup failed: %s", e)
-    try:
-        return httpx.Client(timeout=10.0, verify=False)
-    except Exception:
-        logging.exception("status client unverified setup also failed")
-        return None
-
-
-def fetch_claude_status() -> Optional[Tuple[str, str]]:
-    client = _status_client()
-    if client is None:
-        return None
-    try:
-        with client as c:
-            r = c.get("https://status.claude.com/api/v2/components.json")
-            if r.status_code != 200:
-                return None
-            data = r.json()
-        for c in data.get("components", []):
-            name = (c.get("name") or "").strip().lower()
-            if name == "claude.ai":
-                key = c.get("status") or "operational"
-                label = STATUS_COLORS.get(key,
-                                          (key.replace("_", " ").title(), None))[0]
-                return (key, label)
-    except Exception:
-        logging.exception("status fetch failed")
-    return None
-
-
-# ---------- version / update check ----------
-
-def _parse_version(s: str) -> Tuple[int, ...]:
-    s = (s or "").strip().lstrip("vV")
-    s = s.split()[0] if s else ""
-    out = []
-    for piece in s.split("."):
-        try:
-            out.append(int("".join(ch for ch in piece if ch.isdigit())))
-        except ValueError:
-            out.append(0)
-    return tuple(out) if out else (0,)
-
-
-def fetch_latest_version() -> Optional[str]:
-    if not UPDATE_VERSION_URL:
-        return None
-    try:
-        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
-            r = client.get(
-                UPDATE_VERSION_URL,
-                headers={
-                    "Accept": "application/vnd.github+json",
-                    "User-Agent": f"claude-usage-widget/{__version__}",
-                },
-            )
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if data.get("draft") or data.get("prerelease"):
-            return None
-        tag = data.get("tag_name") or ""
-        return tag.lstrip("vV") or None
-    except Exception:
-        logging.exception("update check failed")
-    return None
+# STATUS_COLORS, CLAUDE_STATUS_URL, fetch_claude_status, _parse_version,
+# fetch_latest_version all live in claude_api.py (imported at the top).
+# Mac's previous _status_client used a three-strategy SSL setup at the
+# constructor level, which was unreachable -- httpx.Client() never raises
+# at construction. The shared claude_api.fetch_claude_status moves the
+# cascade to the request site where it actually catches SSL failures.
 
 
 # ---------- macOS notification ----------
@@ -380,113 +261,8 @@ def show_dialog(text: str, buttons: List[str], default: Optional[str] = None,
         return None
 
 
-# ---------- claude.ai usage fetcher (same logic as Windows version) ----------
-
-class ClaudeUsageFetcher:
-    BASE = "https://claude.ai"
-    USAGE_PATH = "/api/organizations/{org}/usage"
-    DEFAULT_UA = mac_cookie_sources.UA_DESKTOP
-    SESSION_KEYS = ("five_hour", "current_session", "session")
-    WEEKLY_KEYS = ("seven_day", "weekly", "week")
-
-    def __init__(self, cookies, user_agent="", org_id=""):
-        self.cookies = dict(cookies or {})
-        self.org_id = (org_id or "").strip()
-        ua = user_agent or self.DEFAULT_UA
-        headers = {
-            "User-Agent": ua,
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Origin": "https://claude.ai",
-            "Referer": "https://claude.ai/settings/billing",
-            "sec-ch-ua": '"Chromium";v="124", "Not-A.Brand";v="99"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-        }
-        self.client = httpx.Client(
-            headers=headers, cookies=self.cookies, timeout=20.0,
-            follow_redirects=True,
-        )
-
-    def close(self):
-        try: self.client.close()
-        except Exception: pass
-
-    def discover_org_id(self) -> Optional[str]:
-        try:
-            r = self.client.get(f"{self.BASE}/api/organizations")
-            if r.status_code != 200:
-                logging.warning("/api/organizations -> %s", r.status_code)
-                return None
-            data = r.json()
-            if isinstance(data, list) and data:
-                org_id = data[0].get("uuid") or data[0].get("id")
-                if isinstance(org_id, str):
-                    return org_id
-        except Exception:
-            logging.exception("discover_org_id error")
-        return None
-
-    def fetch(self):
-        if not self.cookies:
-            return None
-        if not self.org_id:
-            self.org_id = self.discover_org_id() or ""
-            if not self.org_id:
-                return None
-        url = self.BASE + self.USAGE_PATH.format(org=self.org_id)
-        try:
-            r = self.client.get(url)
-        except Exception:
-            logging.exception("usage request error")
-            return None
-        if r.status_code != 200:
-            logging.info("usage endpoint -> %s body=%s",
-                         r.status_code, r.text[:300].replace("\n", " "))
-            return None
-        try:
-            data = r.json()
-        except Exception:
-            return None
-        return self._extract_percents(data)
-
-    @classmethod
-    def _extract_percents(cls, data):
-        def to_pct(v):
-            try: f = float(v)
-            except (TypeError, ValueError): return None
-            if 0 <= f <= 100.0:
-                return f
-            return None
-        s = w = None
-        s_reset = w_reset = ""
-        if isinstance(data, dict):
-            for k in cls.SESSION_KEYS:
-                v = data.get(k)
-                if isinstance(v, dict) and "utilization" in v:
-                    p = to_pct(v["utilization"])
-                    if p is not None:
-                        s = p
-                        r = v.get("resets_at")
-                        if isinstance(r, str):
-                            s_reset = r
-                        break
-            for k in cls.WEEKLY_KEYS:
-                v = data.get(k)
-                if isinstance(v, dict) and "utilization" in v:
-                    p = to_pct(v["utilization"])
-                    if p is not None:
-                        w = p
-                        r = v.get("resets_at")
-                        if isinstance(r, str):
-                            w_reset = r
-                        break
-        if s is None or w is None:
-            return None
-        return (s, w, s_reset, w_reset)
+# ClaudeUsageFetcher lives in claude_api.py. Mac construction sites
+# pass platform="macOS" and the Chrome-on-macOS UA from mac_cookie_sources.
 
 
 # ---------- macOS-specific setup ----------
@@ -814,7 +590,7 @@ class MenuBarApp(rumps.App):
         if res is None:
             return (None, "Claude desktop app not signed in or keychain blocked")
         source_label, cookies, ua = res
-        f = ClaudeUsageFetcher(cookies, user_agent=ua,
+        f = ClaudeUsageFetcher(cookies, user_agent=ua, platform="macOS",
                                org_id=self.config.get("org_id", ""))
         return (f, source_label)
 
@@ -914,7 +690,7 @@ class MenuBarApp(rumps.App):
         while not self.stop_evt.is_set():
             ok = False
             try:
-                latest = fetch_latest_version()
+                latest = fetch_latest_version(_GITHUB_API_UA)
                 if latest:
                     ok = True
                     self.latest_version = latest
