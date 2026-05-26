@@ -158,8 +158,7 @@ begin
       end;
     end;
   end;
-  Log(Format('CleanupOldTrayIcons: removed %d Claude Usage orphan entries',
-             [removed]));
+  Log(Format('CleanupOldTrayIcons: removed %d Claude Usage orphan entries', [removed]));
 end;
 
 
