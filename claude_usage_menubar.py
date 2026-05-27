@@ -30,7 +30,6 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-import httpx
 import rumps
 from PIL import Image, ImageDraw
 
@@ -115,7 +114,10 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     try:
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        # Snapshot before json.dumps so a concurrent dict mutation from
+        # another thread doesn't raise "dictionary changed size during
+        # iteration" mid-serialization.
+        CONFIG_FILE.write_text(json.dumps(dict(cfg), indent=2), encoding="utf-8")
     except Exception:
         logging.exception("Failed to save config")
 
@@ -484,7 +486,6 @@ class MenuBarApp(rumps.App):
         path string (which forces its NSImage cache to invalidate).
         Returns the active path."""
         idx = self._icon_counter
-        self._icon_counter = (self._icon_counter + 1) % 2
         target = _ICON_PATHS[idx]
         tmp = target.with_suffix(target.suffix + ".tmp")
         try:
@@ -493,9 +494,16 @@ class MenuBarApp(rumps.App):
             os.replace(str(tmp), str(target))
         except Exception:
             logging.exception("icon save failed")
-            # If we never got the file written, hand back the OTHER path
-            # (which presumably still has the previous frame).
+            # The write failed before os.replace, so `target` still holds
+            # the previous frame. Return the OTHER path (also a previous
+            # frame, the one we wrote two ticks ago). Do NOT advance
+            # _icon_counter -- the next successful write should still
+            # land on `target`, NOT clobber the path we just returned.
             return _ICON_PATHS[(idx + 1) % 2]
+        # Only advance the counter once we've actually written a new
+        # frame to `target`. Otherwise repeated failures would alternate
+        # between the two paths without producing anything new.
+        self._icon_counter = (self._icon_counter + 1) % 2
         return target
 
     def _refresh_icon_and_menu(self) -> None:

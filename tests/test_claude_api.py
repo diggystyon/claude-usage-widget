@@ -188,3 +188,308 @@ def test_status_colors_outages_have_colors():
         label, color = claude_api.STATUS_COLORS[key]
         assert label  # non-empty
         assert color is not None and len(color) == 3
+
+
+# ---------- ClaudeUsageFetcher header stripping (extended) ----------
+
+def test_fetcher_strips_authorization_and_friends():
+    """v1.3.1: extra_headers filter was extended to strip not just
+    cookie/host/content-length but also authorization, origin, referer,
+    accept-encoding. If any of those leak through, the request either
+    decodes wrong (br with no brotli installed) or impersonates a
+    different security context."""
+    f = claude_api.ClaudeUsageFetcher(
+        {"sessionKey": "x"},
+        user_agent="test-ua",
+        extra_headers={
+            "Authorization": "Bearer attacker-token",
+            "Origin": "https://evil.example.com",
+            "Referer": "https://evil.example.com/",
+            "Accept-Encoding": "br",
+            "X-Real-Custom": "should-survive",
+        },
+    )
+    try:
+        h = f.client.headers
+        # These would override our claude.ai-correct values or break decode.
+        assert h.get("Authorization") != "Bearer attacker-token"
+        assert h.get("Origin") == "https://claude.ai"
+        assert h.get("Referer") == "https://claude.ai/settings/billing"
+        # Accept-Encoding either absent or httpx default (NOT br alone).
+        ae = (h.get("Accept-Encoding") or "").lower()
+        assert "br" not in ae or ae != "br"  # br can appear in httpx default but never as the only value from our filter
+        # Genuine custom header passes through.
+        assert h.get("X-Real-Custom") == "should-survive"
+    finally:
+        f.close()
+
+
+# ---------- fetch_claude_status SSL cascade ----------
+#
+# These tests patch claude_api.httpx.Client to verify the cascade order
+# is: (1) default -> (2) certifi-explicit -> (3) verify=False.
+# Pre-v1.2.0 Mac had the cascade at the constructor level, where it was
+# unreachable -- httpx.Client() never raises on its own. Verifying the
+# cascade now lives at the request site protects against a future
+# "cleanup" silently re-introducing that bug.
+
+class _MockResp:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {
+            "components": [{"name": "claude.ai", "status": "operational"}]
+        }
+        self.text = "ok"
+
+    def json(self):
+        return self._payload
+
+
+def _mock_client_factory(*, raise_for, returns):
+    """Build a fake httpx.Client class that records each construction
+    and raises/returns according to the script.
+
+    raise_for: list of (verify_arg, exception_or_None) -- in order; for
+      each construction we raise the matching exception if not None, or
+      yield the matching mock response from `returns` if None.
+    returns: list of _MockResp to yield in order on successful .get().
+    """
+    instances = {"count": 0, "kwargs": []}
+    returns_iter = iter(returns)
+
+    class _MC:
+        def __init__(self, *args, **kwargs):
+            i = instances["count"]
+            instances["count"] += 1
+            instances["kwargs"].append(kwargs)
+            self._script = raise_for[i] if i < len(raise_for) else None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, **kwargs):  # accept headers= and similar
+            if self._script is not None:
+                raise self._script
+            return next(returns_iter)
+
+    return _MC, instances
+
+
+def test_status_cascade_default_succeeds(monkeypatch):
+    """Happy path: the default SSL strategy works, no fallback attempted."""
+    import httpx as _httpx
+    MC, instances = _mock_client_factory(
+        raise_for=[None],
+        returns=[_MockResp(200)],
+    )
+    monkeypatch.setattr(claude_api.httpx, "Client", MC)
+    out = claude_api.fetch_claude_status()
+    assert out == ("operational", "All systems operational")
+    # Exactly ONE client constructed (no fallback needed).
+    assert instances["count"] == 1
+    # Default strategy has no `verify` kwarg.
+    assert "verify" not in instances["kwargs"][0]
+
+
+def test_status_cascade_falls_through_default_to_certifi(monkeypatch, tmp_path):
+    """Default SSL fails with a transport error -> we fall through to
+    the certifi-explicit strategy, which succeeds."""
+    import httpx as _httpx
+    # Force certifi.where() to return a path we know exists, so the
+    # certifi strategy actually gets added.
+    fake_pem = tmp_path / "cacert.pem"
+    fake_pem.write_text("dummy")
+    monkeypatch.setattr(claude_api, "_status_ssl_strategies",
+                        lambda: [("default", None), ("certifi", str(fake_pem)), ("unverified", False)])
+
+    MC, instances = _mock_client_factory(
+        raise_for=[_httpx.ConnectError("ssl"), None],
+        returns=[_MockResp(200)],
+    )
+    monkeypatch.setattr(claude_api.httpx, "Client", MC)
+    out = claude_api.fetch_claude_status()
+    assert out == ("operational", "All systems operational")
+    # Two clients constructed: default (failed) + certifi (succeeded).
+    assert instances["count"] == 2
+    assert instances["kwargs"][0].get("verify") is None or "verify" not in instances["kwargs"][0]
+    assert instances["kwargs"][1].get("verify") == str(fake_pem)
+
+
+def test_status_cascade_falls_through_to_unverified(monkeypatch):
+    """Both default AND certifi fail -> we use verify=False as a last
+    resort. This is the path that keeps the status dot working when the
+    bundled CA path is broken inside a PyInstaller bundle."""
+    import httpx as _httpx
+    monkeypatch.setattr(claude_api, "_status_ssl_strategies",
+                        lambda: [("default", None), ("certifi", "/no/such"), ("unverified", False)])
+    MC, instances = _mock_client_factory(
+        raise_for=[
+            _httpx.ConnectError("ssl1"),
+            _httpx.ConnectError("ssl2"),
+            None,
+        ],
+        returns=[_MockResp(200)],
+    )
+    monkeypatch.setattr(claude_api.httpx, "Client", MC)
+    out = claude_api.fetch_claude_status()
+    assert out == ("operational", "All systems operational")
+    assert instances["count"] == 3
+    assert instances["kwargs"][2].get("verify") is False
+
+
+def test_status_cascade_all_strategies_fail_returns_none(monkeypatch):
+    """Every strategy fails -> return None (status dot stays whatever
+    it was, doesn't crash the loop)."""
+    import httpx as _httpx
+    monkeypatch.setattr(claude_api, "_status_ssl_strategies",
+                        lambda: [("default", None), ("unverified", False)])
+    MC, instances = _mock_client_factory(
+        raise_for=[
+            _httpx.ConnectError("a"),
+            _httpx.ConnectError("b"),
+        ],
+        returns=[],
+    )
+    monkeypatch.setattr(claude_api.httpx, "Client", MC)
+    out = claude_api.fetch_claude_status()
+    assert out is None
+    assert instances["count"] == 2
+
+
+def test_status_non_200_returns_none_without_fallback(monkeypatch):
+    """A real HTTP response with status != 200 is not an SSL failure --
+    we treat it as 'no signal' and return None without trying other
+    strategies. Statuspage being briefly 503 shouldn't burn the
+    fallback cascade."""
+    MC, instances = _mock_client_factory(
+        raise_for=[None],
+        returns=[_MockResp(503)],
+    )
+    monkeypatch.setattr(claude_api.httpx, "Client", MC)
+    out = claude_api.fetch_claude_status()
+    assert out is None
+    assert instances["count"] == 1
+
+
+def test_status_parses_non_operational_state(monkeypatch):
+    """When claude.ai reports degraded_performance, we surface the
+    right label."""
+    payload = {
+        "components": [
+            {"name": "API", "status": "operational"},
+            {"name": "Claude.ai", "status": "degraded_performance"},
+        ],
+    }
+    MC, _ = _mock_client_factory(
+        raise_for=[None],
+        returns=[_MockResp(200, payload=payload)],
+    )
+    monkeypatch.setattr(claude_api.httpx, "Client", MC)
+    out = claude_api.fetch_claude_status()
+    assert out == ("degraded_performance", "Degraded performance")
+
+
+# ---------- fetch_latest_version ----------
+
+def test_fetch_latest_version_happy_path(monkeypatch):
+    payload = {"tag_name": "v1.5.0", "draft": False, "prerelease": False}
+    MC, _ = _mock_client_factory(
+        raise_for=[None],
+        returns=[_MockResp(200, payload=payload)],
+    )
+    monkeypatch.setattr(claude_api.httpx, "Client", MC)
+    assert claude_api.fetch_latest_version("test-ua/1.0") == "1.5.0"
+
+
+def test_fetch_latest_version_strips_v_prefix(monkeypatch):
+    """Both 'v1.5.0' and '1.5.0' tags are valid; we always strip the
+    leading 'v' for comparison."""
+    payload = {"tag_name": "v2.0.0"}
+    MC, _ = _mock_client_factory(
+        raise_for=[None],
+        returns=[_MockResp(200, payload=payload)],
+    )
+    monkeypatch.setattr(claude_api.httpx, "Client", MC)
+    assert claude_api.fetch_latest_version("test-ua/1.0") == "2.0.0"
+
+
+def test_fetch_latest_version_skips_draft(monkeypatch):
+    """Draft releases must never be surfaced as 'update available' --
+    they're invisible to the public anyway."""
+    payload = {"tag_name": "v9.9.9", "draft": True}
+    MC, _ = _mock_client_factory(
+        raise_for=[None],
+        returns=[_MockResp(200, payload=payload)],
+    )
+    monkeypatch.setattr(claude_api.httpx, "Client", MC)
+    assert claude_api.fetch_latest_version("test-ua/1.0") is None
+
+
+def test_fetch_latest_version_skips_prerelease(monkeypatch):
+    """Same for prereleases -- the GitHub /releases/latest endpoint
+    already filters these, but we defense-in-depth on the client too."""
+    payload = {"tag_name": "v9.9.9-rc1", "prerelease": True}
+    MC, _ = _mock_client_factory(
+        raise_for=[None],
+        returns=[_MockResp(200, payload=payload)],
+    )
+    monkeypatch.setattr(claude_api.httpx, "Client", MC)
+    assert claude_api.fetch_latest_version("test-ua/1.0") is None
+
+
+def test_fetch_latest_version_non_200_returns_none(monkeypatch):
+    """Rate-limited (403), gone (404), or server error: all return
+    None so the loop just sleeps and tries again later."""
+    for code in (403, 404, 500, 502):
+        MC, _ = _mock_client_factory(
+            raise_for=[None],
+            returns=[_MockResp(code)],
+        )
+        monkeypatch.setattr(claude_api.httpx, "Client", MC)
+        assert claude_api.fetch_latest_version("test-ua/1.0") is None, f"code={code}"
+
+
+def test_fetch_latest_version_network_error_returns_none(monkeypatch):
+    """Network down? Return None so the update loop just retries."""
+    import httpx as _httpx
+    MC, _ = _mock_client_factory(
+        raise_for=[_httpx.ConnectError("no network")],
+        returns=[],
+    )
+    monkeypatch.setattr(claude_api.httpx, "Client", MC)
+    assert claude_api.fetch_latest_version("test-ua/1.0") is None
+
+
+def test_fetch_latest_version_passes_user_agent(monkeypatch):
+    """GitHub requires a User-Agent on API calls. Verify ours actually
+    goes through."""
+    payload = {"tag_name": "v1.0.0"}
+    seen_headers = {}
+
+    class _MC:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, headers=None):
+            seen_headers.update(headers or {})
+
+            class R:
+                status_code = 200
+
+                def json(self_inner):
+                    return payload
+
+            return R()
+
+    monkeypatch.setattr(claude_api.httpx, "Client", _MC)
+    claude_api.fetch_latest_version("my-app/1.2.3")
+    assert seen_headers.get("User-Agent") == "my-app/1.2.3"

@@ -29,7 +29,6 @@ import tkinter as tk
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import httpx
 import pystray
 from PIL import Image, ImageDraw
 
@@ -131,7 +130,12 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     try:
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        # Snapshot before json.dumps so a concurrent dict mutation from
+        # another thread doesn't raise "dictionary changed size during
+        # iteration" mid-serialization. dict(cfg) is a shallow copy of
+        # the top-level keys -- nested dicts are still shared, but
+        # nothing in this app mutates nested config values from threads.
+        CONFIG_FILE.write_text(json.dumps(dict(cfg), indent=2), encoding="utf-8")
     except Exception:
         logging.exception("Failed to save config")
 

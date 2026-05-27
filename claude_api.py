@@ -305,8 +305,22 @@ class ClaudeUsageFetcher:
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
         }
+        # Filter dangerous user-supplied headers. The cURL-paste path on
+        # Windows passes whatever the user's browser sent, which may
+        # include headers that would either confuse httpx (Cookie / Host
+        # / Content-Length, all of which httpx manages itself) or
+        # override our claude.ai auth posture (Authorization /
+        # Origin / Referer) or trigger response encodings we can't decode
+        # (Accept-Encoding: br when the brotli package isn't installed).
+        # Blacklist over whitelist because the legitimate set is large
+        # and browser-version-dependent; the dangerous set is short and
+        # stable.
+        _STRIPPED_HEADERS = frozenset((
+            "cookie", "host", "content-length",
+            "authorization", "origin", "referer", "accept-encoding",
+        ))
         for k, v in (extra_headers or {}).items():
-            if k.lower() in ("cookie", "host", "content-length"):
+            if k.lower() in _STRIPPED_HEADERS:
                 continue
             headers[k] = v
         self.client = httpx.Client(
