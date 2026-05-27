@@ -44,13 +44,30 @@ def _user_data_roots() -> List[Tuple[str, Path, str]]:
     Claude desktop app. Browser sources are intentionally not included --
     Chrome/Edge App-Bound Encryption blocks reading their cookies.
 
-    Three install variants are supported:
+    Two install variants are supported:
       - Electron installer in %APPDATA%\\Claude
       - Electron installer in %LOCALAPPDATA%\\Claude
-      - Microsoft Store / UWP package at:
-          %LOCALAPPDATA%\\Packages\\Claude_<publisher>\\LocalCache\\Roaming\\Claude
-    Whichever actually has a Chromium userData layout (Cookies file present)
-    is used.
+
+    The Microsoft Store / UWP install at
+      %LOCALAPPDATA%\\Packages\\Claude_<publisher>\\...
+    is INTENTIONALLY NOT scanned. Two reasons:
+
+    1. UWP's cookie SQLite is opened with FILE_SHARE_NONE, so even
+       CreateFileW with all share flags can't read it. We were already
+       failing-fast with "cookies DB locked even with CreateFileW".
+    2. MORE IMPORTANT: even the brief CreateFileW *attempt* opens a
+       transient handle that MSIX/UWP treats as a reference to the
+       entire package container. Combined with the activity watcher's
+       directory scans, those references can prevent Microsoft Store
+       upgrades from releasing the old install in
+       C:\\Program Files\\WindowsApps\\Claude_<version>_..., which
+       then makes Claude unable to relaunch after the update
+       ("Another program is currently using this file"). Workaround
+       was always "quit the widget"; the real fix is to never touch
+       the UWP package container at all.
+
+    UWP Claude users get cookies from the browser extension or the
+    manual cURL paste flow instead. README.md documents this.
     """
     appdata = Path(os.environ.get("APPDATA", ""))
     localappdata = Path(os.environ.get("LOCALAPPDATA", ""))
@@ -59,17 +76,7 @@ def _user_data_roots() -> List[Tuple[str, Path, str]]:
         candidates.append(appdata / "Claude")
     if localappdata:
         candidates.append(localappdata / "Claude")
-        # Microsoft Store / UWP install. The publisher suffix is deterministic
-        # for a given signing cert but we glob in case it ever changes.
-        packages_dir = localappdata / "Packages"
-        if packages_dir.is_dir():
-            try:
-                for pkg in packages_dir.glob("Claude_*"):
-                    uwp_root = pkg / "LocalCache" / "Roaming" / "Claude"
-                    if uwp_root.is_dir():
-                        candidates.append(uwp_root)
-            except OSError:
-                pass
+    # UWP path explicitly omitted -- see docstring.
 
     out: List[Tuple[str, Path, str]] = []
     for root in candidates:

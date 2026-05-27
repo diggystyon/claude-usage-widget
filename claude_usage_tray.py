@@ -469,21 +469,23 @@ class ActivityWatcher(threading.Thread):
 
     @staticmethod
     def _discover_dirs():
+        # Microsoft Store / UWP Claude is INTENTIONALLY NOT scanned.
+        # Even brief stat/iterdir handles into a UWP package's
+        # LocalCache count as references to the entire package
+        # container; MSIX deployment then can't fully release the old
+        # install in C:\\Program Files\\WindowsApps\\Claude_<version>_...
+        # during a Store upgrade, and Claude fails to relaunch with
+        # "Another program is currently using this file". UWP users
+        # get their data from the browser extension or manual cURL
+        # paste; we don't need to (and must not) watch the package's
+        # directories for activity. Same reasoning as
+        # cookie_sources._user_data_roots.
         roots: List[Path] = []
         appdata = Path(os.environ.get("APPDATA", ""))
         localappdata = Path(os.environ.get("LOCALAPPDATA", ""))
         for base in (appdata, localappdata):
             if base:
                 roots.append(base / "Claude")
-        # Microsoft Store / UWP install
-        if localappdata:
-            packages_dir = localappdata / "Packages"
-            if packages_dir.is_dir():
-                try:
-                    for pkg in packages_dir.glob("Claude_*"):
-                        roots.append(pkg / "LocalCache" / "Roaming" / "Claude")
-                except OSError:
-                    pass
         candidates: List[Path] = []
         for r in roots:
             candidates += [

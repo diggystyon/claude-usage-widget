@@ -32,7 +32,7 @@ The widget needs your claude.ai sign-in cookies so it can call the usage API on 
 
 Source 2 is automatic and silent on a standard install. The two cases where it falls back to the extension or cURL paste:
 
-- **Microsoft Store / UWP install of Claude desktop**: the UWP sandbox holds an exclusive lock on its cookie database. We can't read it from outside.
+- **Microsoft Store / UWP install of Claude desktop**: not supported by source 2. The widget intentionally does not touch UWP-packaged Claude at all -- even brief read attempts hold handles into the package container that prevent Microsoft Store from upgrading Claude in place. (You'd hit "Another program is currently using this file" when Claude tries to relaunch after an update.) Use the browser extension or cURL paste instead.
 - **Chrome 127+ App-Bound Encryption (v20 prefix)**: when Claude desktop's bundled Chromium rolls to v127 or later, its cookies become unreadable from any process outside the browser. The browser extension sidesteps this by running inside the browser's own security context.
 
 If neither source 2 nor the extension works for you, the manual cURL paste is the last-resort fallback.
