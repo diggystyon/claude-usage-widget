@@ -436,15 +436,30 @@ class ActivityWatcher(threading.Thread):
     DEBOUNCE_SEC = 3.0       # wait this long after the last change
     MIN_INTERVAL_SEC = 30.0  # don't trigger more than once per N sec
     POLL_SEC = 2.0           # how often to scan the watched dirs
+    # When _snapshot sees filesystem errors on Claude's data dirs, it
+    # strongly suggests Claude is doing update-style work (rename /
+    # replace / package deployment). Back off for this long so we
+    # don't keep holding short-lived handles that would block the
+    # update from completing. Also exposed via is_filesystem_unsafe()
+    # so the cookie reader can skip its own filesystem touches during
+    # the same window.
+    FS_BACKOFF_SEC = 30.0
 
     def __init__(self, on_activity, stop_evt: threading.Event) -> None:
         super().__init__(daemon=True, name="ActivityWatcher")
         self.on_activity = on_activity
         self.stop_evt = stop_evt
         self.watch_dirs = self._discover_dirs()
-        self.last_seen = self._snapshot()
+        # Initial snapshot: discard the error count; we expect it to be
+        # zero in the normal case and there's no useful action on
+        # startup other than logging the warning, which run() does.
+        initial_snap, _ = self._snapshot()
+        self.last_seen = initial_snap
         self.last_triggered = 0.0
         self.pending_until = 0.0
+        # 0.0 means "no backoff"; set to a future timestamp when we
+        # see filesystem errors that look like Claude is updating.
+        self.backoff_until = 0.0
         if self.watch_dirs:
             logging.info("activity watcher: %d dir(s) - %s",
                          len(self.watch_dirs),
@@ -480,22 +495,69 @@ class ActivityWatcher(threading.Thread):
         return [d for d in candidates if d.is_dir()]
 
     def _snapshot(self):
+        """Walk every Claude data directory and capture child mtimes.
+        Returns (snapshot_dict, error_count). The error count is the
+        number of OSErrors we saw -- non-zero strongly suggests Claude
+        is doing filesystem work (rename, replace, package deploy)
+        that's colliding with our enumeration, in which case run()
+        will set a backoff.
+
+        Important: iterdir() returns a generator backed by a Windows
+        directory handle. If we statted children inside the iteration,
+        the handle would stay open the entire walk -- enough to block
+        Claude's auto-updater from renaming the directory. We
+        materialize the entries into a list FIRST so the directory
+        handle releases before any stat call. Microseconds of handle
+        hold instead of milliseconds-per-file. The user-reported bug
+        ("widget interfered with Claude trying to update") was caused
+        by the old in-iteration version of this code.
+        """
         out = {}
+        errors = 0
         for d in self.watch_dirs:
             try:
-                for p in d.iterdir():
-                    try:
-                        out[str(p)] = p.stat().st_mtime
-                    except OSError:
-                        pass
+                entries = list(d.iterdir())
             except OSError:
-                pass
-        return out
+                errors += 1
+                continue
+            for p in entries:
+                try:
+                    out[str(p)] = p.stat().st_mtime
+                except OSError:
+                    errors += 1
+        return out, errors
+
+    def is_filesystem_unsafe(self) -> bool:
+        """True if we've recently seen filesystem errors on Claude's
+        data directories -- meaning Claude is probably mid-update and
+        any handles we hold on its files could break the update. The
+        cookie reader (TrayApp._try_auto_cookies) checks this and
+        skips its own filesystem touches during the backoff window."""
+        return time.time() < self.backoff_until
 
     def run(self) -> None:
         while not self.stop_evt.is_set():
             now = time.time()
-            snap = self._snapshot()
+            # Honor the backoff: skip the snapshot entirely while we
+            # think Claude might be updating. The sleep below still
+            # ticks, so we'll re-check once the backoff expires.
+            if now < self.backoff_until:
+                self.stop_evt.wait(self.POLL_SEC)
+                continue
+            snap, errors = self._snapshot()
+            if errors:
+                # Filesystem errors during iterdir/stat on Claude's
+                # data dirs strongly suggest Claude is doing
+                # update-style work. Back off and log once per
+                # backoff window (not per tick) so the log doesn't
+                # spam if Claude is being updated for several minutes.
+                self.backoff_until = now + self.FS_BACKOFF_SEC
+                logging.info(
+                    "activity watcher: %d filesystem error(s) on Claude data dirs "
+                    "(Claude updating?); pausing activity + auto-cookie reads for %.0fs",
+                    errors, self.FS_BACKOFF_SEC)
+                self.stop_evt.wait(self.POLL_SEC)
+                continue
             if snap != self.last_seen:
                 self.last_seen = snap
                 self.pending_until = now + self.DEBOUNCE_SEC
@@ -804,6 +866,15 @@ class TrayApp:
                 logging.exception("update_menu failed")
 
     def _try_auto_cookies(self) -> Optional[Tuple[str, Dict[str, str], str]]:
+        # If the activity watcher recently saw filesystem errors on
+        # Claude's data dirs, Claude is probably mid-update. Skip the
+        # cookie read so we don't hold a SQLite/CreateFileW handle
+        # that would block the update. The cached cookies still drive
+        # the bars during the backoff window.
+        aw = getattr(self, "activity_watcher", None)
+        if aw is not None and aw.is_filesystem_unsafe():
+            logging.debug("auto-cookies: skipping (activity watcher reports filesystem unsafe)")
+            return None
         try:
             return cookie_sources.fetch_cookies()
         except Exception:
@@ -1135,7 +1206,9 @@ class TrayApp:
         threading.Thread(target=self._status_poll_loop, daemon=True).start()
         threading.Thread(target=self._update_check_loop, daemon=True).start()
         threading.Thread(target=self._promote_tray_loop, daemon=True).start()
-        ActivityWatcher(self._on_activity, self.stop_evt).start()
+        # Store on self so _try_auto_cookies can query is_filesystem_unsafe().
+        self.activity_watcher = ActivityWatcher(self._on_activity, self.stop_evt)
+        self.activity_watcher.start()
         start_bridge_listener(self)
         self.icon = pystray.Icon(APP_DISPLAY_NAME, icon=self._icon_image(),
                                  title=self._tooltip(), menu=self._build_menu())
