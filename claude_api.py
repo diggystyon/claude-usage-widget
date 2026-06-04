@@ -246,6 +246,24 @@ def fetch_latest_version(user_agent: str) -> Optional[str]:
     return None
 
 
+# ---------- shared config migration ----------
+
+def backfill_ever_succeeded(cfg: dict) -> dict:
+    """Migrate configs written before v1.3.5, which predate the
+    'ever_succeeded' flag.
+
+    Mutates and returns cfg. A non-empty 'last_source' is proof the widget
+    previously read usage successfully (last_source is only written on a
+    successful fetch or extension push), so an upgrading user who was
+    already working is treated as configured -- skipping the one-time
+    "setup needed" display that would otherwise flash on first launch
+    after the upgrade, before the next poll lands. Brand-new installs have
+    last_source == "" and correctly stay unconfigured."""
+    if cfg.get("last_source") and not cfg.get("ever_succeeded"):
+        cfg["ever_succeeded"] = True
+    return cfg
+
+
 # ---------- shared display-state classification ----------
 
 def classify_display_state(ever_succeeded: bool,

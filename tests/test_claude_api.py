@@ -74,6 +74,40 @@ def test_display_state_respects_custom_threshold():
     assert claude_api.classify_display_state(True, 1, stale_threshold=2) == "live"
 
 
+# ---------- backfill_ever_succeeded config migration (v1.3.6) ----------
+
+def test_backfill_sets_true_for_upgrading_working_user():
+    # Config from <1.3.5 (no ever_succeeded key) but with a real source:
+    # the user was already working, so they must NOT see "setup needed"
+    # flash on first launch after the upgrade.
+    cfg = {"last_source": "Claude browser extension"}
+    out = claude_api.backfill_ever_succeeded(cfg)
+    assert out["ever_succeeded"] is True
+    assert out is cfg  # mutates in place
+
+
+def test_backfill_leaves_brand_new_install_unconfigured():
+    # Fresh install: no source recorded yet -> stays unconfigured so the
+    # setup hint shows.
+    cfg = {"last_source": ""}
+    claude_api.backfill_ever_succeeded(cfg)
+    assert cfg.get("ever_succeeded") in (None, False)
+
+
+def test_backfill_does_not_clobber_existing_true():
+    cfg = {"last_source": "Manual paste", "ever_succeeded": True}
+    claude_api.backfill_ever_succeeded(cfg)
+    assert cfg["ever_succeeded"] is True
+
+
+def test_backfill_does_not_resurrect_explicit_false_without_source():
+    # An already-migrated config that legitimately never succeeded must
+    # stay False.
+    cfg = {"last_source": "", "ever_succeeded": False}
+    claude_api.backfill_ever_succeeded(cfg)
+    assert cfg["ever_succeeded"] is False
+
+
 # ---------- ClaudeUsageFetcher._extract_percents ----------
 
 def test_extract_percents_five_hour_seven_day_shape():

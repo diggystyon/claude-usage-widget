@@ -41,6 +41,7 @@ from claude_api import (
     UPDATE_DOWNLOAD_URL,
     _parse_version,
     _setup_bundled_certifi,
+    backfill_ever_succeeded,
     classify_display_state,
     fetch_claude_status,
     fetch_latest_version,
@@ -128,7 +129,7 @@ def load_config() -> dict:
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             for k, v in DEFAULT_CONFIG.items():
                 cfg.setdefault(k, v)
-            return cfg
+            return backfill_ever_succeeded(cfg)
         except Exception:
             logging.exception("Failed to load config; using defaults")
     return dict(DEFAULT_CONFIG)
