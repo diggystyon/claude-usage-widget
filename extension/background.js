@@ -16,6 +16,17 @@ const MAX_BACKOFF_MINUTES = 15;
 // the widget isn't installed on this machine. Reset to 0 on success.
 let postFailureCount = 0;
 let currentPollMinutes = BASE_POLL_MINUTES;
+// Track consecutive claude.ai authentication rejections so we can rewrite
+// the toolbar tooltip with actionable text. The badge ("!") fires on the
+// FIRST failure (so the user sees a signal immediately), but the tooltip
+// only switches to the sign-in hint after AUTH_FAIL_HINT_THRESHOLD in a
+// row, to avoid alarming on a single transient blip during a session
+// rotation. Resets to 0 on any successful /usage fetch.
+let consecutiveAuthFailures = 0;
+const AUTH_FAIL_HINT_THRESHOLD = 3;
+const DEFAULT_TITLE = "Claude Usage Bridge";
+const AUTH_FAIL_TITLE =
+  "Claude Usage Bridge -- sign in to claude.ai in this browser";
 
 async function getOrgId() {
   const cached = (await chrome.storage.local.get("orgId")).orgId;
@@ -37,6 +48,31 @@ function setBadge(text, color) {
     if (color) chrome.action.setBadgeBackgroundColor({ color });
     chrome.action.setBadgeText({ text: text || "" });
   } catch (_) { /* ignore - some browsers may not support */ }
+}
+
+function setTitle(text) {
+  try {
+    chrome.action.setTitle({ title: text || DEFAULT_TITLE });
+  } catch (_) { /* ignore */ }
+}
+
+function noteAuthFailure() {
+  // Called every time claude.ai rejects us with a 4xx (either on
+  // /api/organizations during getOrgId, or on /usage). Bumps the
+  // counter, and once we're confident the failure is sticky (not a
+  // single transient 401 from a session rotation) we rewrite the
+  // toolbar tooltip so hovering tells the user exactly what to do.
+  consecutiveAuthFailures += 1;
+  if (consecutiveAuthFailures >= AUTH_FAIL_HINT_THRESHOLD) {
+    setTitle(AUTH_FAIL_TITLE);
+  }
+}
+
+function noteAuthSuccess() {
+  if (consecutiveAuthFailures > 0) {
+    consecutiveAuthFailures = 0;
+    setTitle(DEFAULT_TITLE);
+  }
 }
 
 function adjustPollCadence() {
@@ -62,11 +98,19 @@ async function fetchAndPost() {
   try {
     orgId = await getOrgId();
   } catch (e) {
+    // /api/organizations failed. The overwhelmingly common cause is
+    // 401/403 because the user is signed out of claude.ai in THIS
+    // browser; we treat that as an auth failure for tooltip purposes.
+    // Transport errors and 5xx land here too, but the cost of including
+    // them in the counter is just an early sign-in hint, which is
+    // harmless (the next success resets it).
     setBadge("?", "#aa6633");
+    noteAuthFailure();
     return;
   }
   if (!orgId) {
     setBadge("?", "#aa6633");
+    noteAuthFailure();
     return;
   }
   let usage;
@@ -79,11 +123,16 @@ async function fetchAndPost() {
       // the cache and let the next poll retry.)
       if (r.status >= 400 && r.status < 500) {
         await evictOrgId();
+        noteAuthFailure();
       }
       setBadge("!", "#cc4444");
       return;
     }
     usage = await r.json();
+    // Authenticated /usage response received; whatever was wrong is
+    // now fixed. Clear the failure counter and restore the default
+    // toolbar tooltip.
+    noteAuthSuccess();
   } catch (e) {
     setBadge("!", "#cc4444");
     return;
@@ -140,4 +189,17 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "poll") fetchAndPost();
+});
+
+// Clicking the toolbar icon opens claude.ai in a new tab. This is the
+// fix for the most common breakage (the user got signed out of claude.ai
+// in this browser), so making it a one-click action turns the "!"
+// tooltip hint into an actual recovery path. We do this unconditionally
+// -- even when healthy, "click the extension to open claude.ai" is a
+// reasonable affordance. The browser only fires onClicked when the
+// action has no popup, which our manifest doesn't define.
+chrome.action.onClicked.addListener(() => {
+  try {
+    chrome.tabs.create({ url: "https://claude.ai/" });
+  } catch (_) { /* ignore */ }
 });

@@ -20,7 +20,10 @@ Same as Edge but at `chrome://extensions/`.
 ## Verify it's working
 
 1. Open the tray widget. Tooltip shows **Source: Claude browser extension** within ~60 seconds.
-2. The extension icon in your toolbar should have no badge. If you see a `?` or `!`, you're either signed out of claude.ai or the widget isn't running.
+2. The extension icon in your toolbar should have no badge. If you see a `?` or `!`:
+   - **Hover the toolbar icon.** If the tooltip says "sign in to claude.ai in this browser", that's the fix -- open https://claude.ai and sign in.
+   - **Click the toolbar icon.** That opens claude.ai in a new tab for you. Once you're signed in, the badge clears within a minute and the widget catches up.
+   - **Widget isn't running.** The extension doesn't badge for this case (it just silently backs off), but if the widget tray icon is gone, relaunch it from the Start Menu.
 
 ## What it does (and doesn't)
 

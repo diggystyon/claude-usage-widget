@@ -292,6 +292,13 @@ class ClaudeUsageFetcher:
             raise ValueError("user_agent must be supplied by the caller")
         self.cookies = dict(cookies or {})
         self.org_id = (org_id or "").strip()
+        # Populated by fetch() on every call. last_error_code is set to
+        # claude.ai's machine-readable error_code (e.g.
+        # "account_session_invalid") when the API returns a JSON error
+        # body, so the caller can distinguish auth failure from a network
+        # blip without reparsing the log. Both reset to None on success.
+        self.last_status_code: Optional[int] = None
+        self.last_error_code: Optional[str] = None
         headers = {
             "User-Agent": user_agent,
             "Accept": "application/json, text/plain, */*",
@@ -358,7 +365,17 @@ class ClaudeUsageFetcher:
         on success or None on any failure (no cookies, no org_id,
         non-200, non-JSON, no recognizable keys in the JSON).
         Reset strings are the raw ISO 8601 from the API, or "" if
-        absent."""
+        absent.
+
+        On failure, callers can read self.last_status_code (HTTP code or
+        None on transport error) and self.last_error_code (claude.ai's
+        machine-readable error_code from the response body, e.g.
+        "account_session_invalid", or None if no parseable error body).
+        Both reset to None at the start of every fetch() and stay None
+        on success.
+        """
+        self.last_status_code = None
+        self.last_error_code = None
         if not self.cookies:
             return None
         if not self.org_id:
@@ -373,6 +390,11 @@ class ClaudeUsageFetcher:
             logging.exception("usage request error")
             return None
         if r.status_code != 200:
+            # Only populate the failure-diagnostic attributes on actual
+            # failure. Leaving them at None on success keeps the caller
+            # invariant "read these iff fetch() returned None" simple.
+            self.last_status_code = r.status_code
+            self.last_error_code = self._parse_error_code(r.text)
             logging.info("usage endpoint -> %s body=%s",
                          r.status_code, r.text[:300].replace("\n", " "))
             return None
@@ -382,6 +404,33 @@ class ClaudeUsageFetcher:
             logging.exception("usage response not JSON: %s", r.text[:300])
             return None
         return self._extract_percents(data)
+
+    @staticmethod
+    def _parse_error_code(body: str) -> Optional[str]:
+        """Best-effort extraction of claude.ai's error.details.error_code
+        from a non-200 response body. Returns None on any failure (not
+        JSON, missing keys, wrong shape) so callers can treat absence as
+        'unknown failure' instead of mistaking it for a specific code.
+
+        Example payload we care about:
+          {"type":"error","error":{"type":"permission_error",
+           "message":"Invalid authorization",
+           "details":{"error_code":"account_session_invalid", ...}},
+           "request_id":"..."}
+        """
+        try:
+            import json
+            data = json.loads(body or "")
+            err = data.get("error") if isinstance(data, dict) else None
+            if not isinstance(err, dict):
+                return None
+            details = err.get("details")
+            if not isinstance(details, dict):
+                return None
+            code = details.get("error_code")
+            return code if isinstance(code, str) and code else None
+        except Exception:
+            return None
 
     @classmethod
     def _extract_percents(cls,

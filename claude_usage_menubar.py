@@ -406,6 +406,12 @@ class MenuBarApp(rumps.App):
         self.latest_version: Optional[str] = None
         self.stop_evt = threading.Event()
         self.last_fetch_at: float = 0.0
+        # Consecutive fetches that returned claude.ai's
+        # account_session_invalid error. Reset to 0 on any successful
+        # fetch. Drives the "sign-in needed" suffix on the Source line
+        # so the menu actually tells the user what's broken instead of
+        # silently keeping stale bars on screen.
+        self.consecutive_auth_failures: int = 0
 
         self.mi_pct       = rumps.MenuItem("Session: --%   Weekly: --%")
         self.mi_source    = rumps.MenuItem("Source: -")
@@ -534,7 +540,15 @@ class MenuBarApp(rumps.App):
         w_reset = fmt_reset(self.config.get("weekly_resets_at", ""), short=False)
         if s_reset and w_reset:
             self.mi_pct.title += f"   |   resets {s_reset} / {w_reset}"
-        self.mi_source.title = f"Source: {src}"
+        # After 3 consecutive account_session_invalid responses, surface
+        # a sign-in hint on the Source line. The bars themselves stay
+        # frozen at the last successful read until the user re-auths.
+        # We don't gate on N=1 because a single transient 401 from a
+        # token refresh shouldn't flip the menu into an alarm state.
+        if self.consecutive_auth_failures >= 3:
+            self.mi_source.title = f"Source: {src} -- sign in to Claude desktop"
+        else:
+            self.mi_source.title = f"Source: {src}"
         self.mi_status.title = f"Claude.ai: {self.claude_status_label}"
         self.mi_version.title = self._version_label()
 
@@ -625,10 +639,19 @@ class MenuBarApp(rumps.App):
             return
         try:
             res = f.fetch()
+            err_code = f.last_error_code
         finally:
             f.close()
         if res is None:
+            # Track auth failures separately so the menu can call out
+            # "sign-in needed" once it's clear this isn't a transient
+            # blip. error_code "account_session_invalid" is the
+            # machine-readable signal from claude.ai that the user's
+            # session cookies are no longer valid.
+            if err_code == "account_session_invalid":
+                self.consecutive_auth_failures += 1
             self._maybe_notify_failure("API call failed -- see log")
+            self._refresh_icon_and_menu()
             return
         s, w, s_reset, w_reset = res
         self.session_pct = s
@@ -642,6 +665,7 @@ class MenuBarApp(rumps.App):
             self.config["org_id"] = f.org_id
         save_config(self.config)
         self.last_fetch_at = time.time()
+        self.consecutive_auth_failures = 0
         self._refresh_icon_and_menu()
 
     def _poll_loop(self) -> None:

@@ -726,6 +726,13 @@ class TrayApp:
         self.stop_evt = threading.Event()
         self.last_status = "Starting..."
         self.last_extension_push_at = 0.0  # epoch seconds; 0 = never
+        # How many consecutive widget-side fetches have come back with
+        # claude.ai's account_session_invalid error. Reset to 0 on any
+        # successful fetch or successful extension push. Used by
+        # _tooltip() to switch from the generic "Refresh failed at HH:MM"
+        # message to a clearer "sign in to claude.ai" hint once we've
+        # confirmed the failure isn't a transient blip.
+        self.consecutive_auth_failures = 0
         self.claude_status_key = "operational"
         self.claude_status_label = "All systems operational"
         self.latest_version: Optional[str] = None  # None = not yet checked
@@ -972,8 +979,17 @@ class TrayApp:
                     self.config["org_id"] = fetcher.org_id
                 save_config(self.config)
                 self.last_status = f"Updated {fmt_time_12h()}"
+                self.consecutive_auth_failures = 0
             else:
-                self.last_status = f"Refresh failed at {fmt_time_12h()}"
+                # Distinguish authentication failure (cookies bad / user
+                # signed out) from generic refresh failure so the tooltip
+                # can tell the user what to actually do. The fetcher
+                # exposes claude.ai's error_code from the response body.
+                if fetcher.last_error_code == "account_session_invalid":
+                    self.consecutive_auth_failures += 1
+                self.last_status = self._auth_failure_hint(source_label) \
+                    if self.consecutive_auth_failures >= 3 \
+                    else f"Refresh failed at {fmt_time_12h()}"
                 self._maybe_notify(
                     "Claude Usage - sign-in needed",
                     "Couldn't read usage. Open the Claude desktop app and make sure you're signed in.",
@@ -984,6 +1000,26 @@ class TrayApp:
         finally:
             fetcher.close()
         self._refresh_icon()
+
+    def _auth_failure_hint(self, source_label: str) -> str:
+        """Return a short, actionable tooltip line for the case where the
+        widget has been getting account_session_invalid back from
+        claude.ai for several polls in a row.
+
+        We pick the wording based on whether we've ever seen the browser
+        extension push to us. If we have, the fix is "sign in to claude.ai
+        in your browser" (the extension is installed, just unauthenticated).
+        If we never have, the user is likely on a Claude-desktop-only or
+        cURL-paste setup and signing into the desktop app is the lever.
+
+        Tooltip text is appended to the existing Session/Weekly/Source
+        lines, so we have only the remaining bytes under the 128-char
+        Shell_NotifyIcon cap. Keep this string short.
+        """
+        if self.last_extension_push_at > 0 \
+                or "extension" in (source_label or "").lower():
+            return "Sign in to claude.ai in your browser"
+        return "Cookies expired - sign in to Claude desktop"
 
     # ----- menu actions -----
     def _check_status_once(self) -> None:
@@ -1151,6 +1187,10 @@ class TrayApp:
         self.config["last_source"] = new_src
         self.last_extension_push_at = time.time()
         self.last_status = f"Updated {fmt_time_12h()}"
+        # A successful push from the extension implicitly proves claude.ai
+        # accepted the extension's cookies, so any prior auth failures on
+        # the widget-side fallback fetch are no longer relevant.
+        self.consecutive_auth_failures = 0
         save_config(self.config)
         self._refresh_icon()
 

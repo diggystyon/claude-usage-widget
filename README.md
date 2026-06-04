@@ -11,51 +11,66 @@ Hover (or click) for exact percentages and reset times. Bars use a smooth green 
 
 The rest of this document is for the Windows build.
 
-## Quick start (recommended)
+## Quick start
 
-1. Download **`Claude Usage Setup.exe`** from the [latest release](https://github.com/diggystyon/claude-usage-widget/releases/latest).
-2. Double-click it. Click Next, leave "Start Claude Usage when Windows starts" checked, click Install.
-3. The widget launches into your system tray.
-4. (Optional) **Install the bundled browser extension** for hands-off auto-refresh on Chrome 127+ or on the Microsoft Store version of Claude desktop. See "Hands-off mode" below.
+These four steps get most users to working bars. Each step takes under a minute.
 
-> Windows SmartScreen may warn on first launch since the installer isn't code-signed. Click **More info**, then **Run anyway**.
+1. **Install the widget.** Download **`Claude Usage Setup.exe`** from the [latest release](https://github.com/diggystyon/claude-usage-widget/releases/latest), double-click, click through the wizard. The widget launches into your system tray.
+
+2. **Install the browser extension** (one-time, ~30 seconds). After the installer finishes it opens File Explorer at the extension folder and Edge at `edge://extensions/`. In Edge:
+   - Toggle **Developer mode** on (left sidebar).
+   - Click **Load unpacked** and pick the folder Explorer just opened (also at `%LOCALAPPDATA%\Claude Usage\extension\`).
+   - Toggle **Developer mode** back off. The extension keeps running.
+
+   Chrome works identically at `chrome://extensions/`. Firefox isn't supported yet.
+
+3. **Sign in to claude.ai in this same browser.** Open a new tab in Edge (or Chrome), go to https://claude.ai, sign in if prompted. **This is the step most setups forget.** The extension reads cookies from the browser it's installed in -- being signed in via the Claude desktop app or a different browser does not count.
+
+4. **Watch the tray.** Within ~60 seconds the bars catch up and the tooltip shows **Source: Claude browser extension**. Done.
+
+> Windows SmartScreen may warn on first launch since the installer isn't code-signed. Click **More info** > **Run anyway**.
 
 To uninstall: Settings > Apps > Installed apps > Claude Usage > Uninstall.
 
-## What the widget needs to read your usage
+## Verify it's working
 
-The widget needs your claude.ai sign-in cookies so it can call the usage API on your behalf. It tries three sources, in priority order:
+Hover the tray icon. The tooltip's **Source:** line tells you which path is active:
 
-1. **Browser extension** posting to localhost (best - passive, never expires).
-2. **Auto-read from the Claude desktop app's cookie store** (works for the standalone Electron install of [Claude desktop](https://claude.ai/download)). Handled by `cookie_sources.py`.
-3. **Stored cookies from a manual cURL paste** (works until cookies rotate, every few hours).
+| Tooltip says                  | Meaning                                                                                      |
+| ----------------------------- | -------------------------------------------------------------------------------------------- |
+| `Source: browser ext. (Xs ago)` | Working. The extension is pushing fresh data every minute.                                  |
+| `Source: desktop app`         | Working via auto-read. You're on the standalone Electron Claude desktop install; no extension needed. |
+| `Source: manual paste`        | Working via the one-shot cURL paste fallback. Will go stale in a few hours.                  |
+| `Sign in to claude.ai in your browser` | The extension is installed but claude.ai is rejecting it. Sign in to claude.ai in the same browser. |
+| `Cookies expired - sign in to Claude desktop` | No extension, and the desktop / cURL cookies have gone stale. Install the extension or sign back in. |
 
-Source 2 is automatic and silent on a standard install. The two cases where it falls back to the extension or cURL paste:
+If you also see a **`!`** or **`?`** badge on the Claude Usage Bridge icon in your browser toolbar, claude.ai is rejecting the extension's calls -- sign in to https://claude.ai in that browser. Clicking the toolbar icon opens claude.ai for you.
 
-- **Microsoft Store / UWP install of Claude desktop**: not supported by source 2. The widget intentionally does not touch UWP-packaged Claude at all -- even brief read attempts hold handles into the package container that prevent Microsoft Store from upgrading Claude in place. (You'd hit "Another program is currently using this file" when Claude tries to relaunch after an update.) Use the browser extension or cURL paste instead.
-- **Chrome 127+ App-Bound Encryption (v20 prefix)**: when Claude desktop's bundled Chromium rolls to v127 or later, its cookies become unreadable from any process outside the browser. The browser extension sidesteps this by running inside the browser's own security context.
+## If you only use the standalone Electron Claude desktop
 
-If neither source 2 nor the extension works for you, the manual cURL paste is the last-resort fallback.
+The widget can read cookies directly from the standalone Electron build of [Claude desktop](https://claude.ai/download). On that setup the extension is genuinely optional -- the tooltip will read **Source: desktop app** and you can skip steps 2 and 3 above.
 
-## Hands-off mode (browser extension)
+Two cases where this auto-read does *not* work and the browser extension is required:
 
-The installer drops a small browser extension at `%LOCALAPPDATA%\Claude Usage\extension\` (also linked from the Start Menu folder).
+- **Microsoft Store / UWP install of Claude desktop.** The widget intentionally never touches UWP-packaged Claude -- even brief read attempts would hold handles into the package container that prevent Microsoft Store from upgrading Claude in place.
+- **Chrome 127+ App-Bound Encryption.** When Claude desktop's bundled Chromium rolls to v127 or later, its cookies become unreadable from any process outside the browser. The browser extension sidesteps this by running inside the browser's own security context.
 
-To install it:
-
-1. Open `edge://extensions/` (or `chrome://extensions/`).
-2. Toggle **Developer mode** on.
-3. Click **Load unpacked** and pick that `extension` folder.
-
-As long as you stay signed into https://claude.ai in this browser, the extension fetches your usage every minute in the background and posts it to the widget over `127.0.0.1:38080`. **No tab needs to be open**, and you never paste cookies again. The browser process itself just needs to be running, which on Windows it usually is anyway.
-
-The widget tooltip will show **Source: Claude browser extension** within a minute, confirming the bridge is working. The localhost listener only accepts requests with a `chrome-extension://` or `moz-extension://` Origin and rejects payloads larger than 64 KB.
-
-If the extension can't reach the widget for several minutes in a row, it backs off automatically (up to 15-minute intervals) so it doesn't waste battery polling localhost when the widget isn't running.
+When in doubt, just install the extension -- it works in every case.
 
 ## Manual fallback (cURL paste)
 
-If the auto-read from the Claude desktop app doesn't work and you don't want the extension, right-click the tray > **Paste cURL command (fallback)...** lets you supply cookies from a browser tab. This works one-shot but cookies expire every few hours, so it's not a daily workflow.
+If you can't or won't install the extension, right-click the tray > **Paste cURL command (fallback)...** lets you supply cookies from a browser tab. This works one-shot but cookies expire every few hours, so it's not a daily workflow.
+
+## How the browser extension works (technical)
+
+The extension drops at `%LOCALAPPDATA%\Claude Usage\extension\` and is also linked from the Start Menu folder. Once loaded:
+
+- Every 60 seconds it fetches `https://claude.ai/api/organizations/<org>/usage` using the cookies in your current browser session.
+- It POSTs the JSON to `http://127.0.0.1:38080/usage` so the widget can render it. The listener binds to localhost only and only accepts payloads from a `chrome-extension://` or `moz-extension://` Origin.
+- If it can't reach the widget for several minutes (e.g., you closed it), it backs off automatically up to 15-minute intervals.
+- The extension stores nothing remotely. Its only persistent state is your org id, cached locally so it doesn't refetch every minute.
+
+If claude.ai rejects the extension's calls for several minutes in a row, the toolbar tooltip changes to "Claude Usage Bridge -- sign in to claude.ai in this browser" and clicking the icon opens claude.ai.
 
 ## How updates work
 
@@ -73,7 +88,8 @@ To test without an installer: `python claude_usage_tray.py` from a terminal in t
 ## Files
 
 - `claude_usage_tray.py` - the tray app
-- `cookie_sources.py` - Claude desktop cookie discovery and decryption (primary source on standard Electron installs)
+- `claude_api.py` - shared HTTP/version/status helpers (Windows + Mac)
+- `cookie_sources.py` - Claude desktop cookie discovery and decryption (standalone Electron only)
 - `extension/` - browser extension (Manifest V3 service worker)
 - `make_icon.py` - generates `app.ico` and the extension's PNG icons
 - `requirements.txt` - Python deps (installed by `build.bat`)

@@ -493,3 +493,130 @@ def test_fetch_latest_version_passes_user_agent(monkeypatch):
     monkeypatch.setattr(claude_api.httpx, "Client", _MC)
     claude_api.fetch_latest_version("my-app/1.2.3")
     assert seen_headers.get("User-Agent") == "my-app/1.2.3"
+
+
+# ---------- error_code parsing on non-200 (v1.3.4) ----------
+
+def test_parse_error_code_standard_account_session_invalid():
+    """The widget keys its 'sign in to claude.ai' tooltip off this exact
+    error_code. If claude.ai ever changes the field name we want the tests
+    to scream, not to silently keep showing 'Refresh failed' forever."""
+    body = (
+        '{"type":"error",'
+        '"error":{"type":"permission_error",'
+        '"message":"Invalid authorization",'
+        '"details":{"error_visibility":"user_facing",'
+        '"error_code":"account_session_invalid"}},'
+        '"request_id":"req_011Cb"}'
+    )
+    assert claude_api.ClaudeUsageFetcher._parse_error_code(body) \
+        == "account_session_invalid"
+
+
+def test_parse_error_code_returns_none_on_garbage():
+    """Anything that isn't a parseable error envelope returns None.
+    Callers treat None as 'unknown failure', so a false-positive here
+    would mislabel a transport blip as an auth failure."""
+    for bad in ["", "not json at all", "{}", '{"error":"string"}',
+                '{"error":{"details":null}}',
+                '{"error":{"details":{"error_code":42}}}',  # not a string
+                '{"error":{"details":{"error_code":""}}}']:
+        assert claude_api.ClaudeUsageFetcher._parse_error_code(bad) is None, bad
+
+
+def test_parse_error_code_handles_alternative_codes():
+    """The widget only special-cases account_session_invalid today, but
+    the parser should faithfully return whatever code claude.ai sent so
+    future code can branch on more cases without re-parsing."""
+    body = (
+        '{"error":{"details":{"error_code":"organization_not_found"}}}'
+    )
+    assert claude_api.ClaudeUsageFetcher._parse_error_code(body) \
+        == "organization_not_found"
+
+
+def test_fetch_sets_last_error_code_on_403(monkeypatch):
+    """The widget's auth-failure counter reads fetcher.last_error_code
+    after a None result. This test wires up a fake claude.ai that returns
+    the real-world account_session_invalid body on /usage and verifies
+    fetch() exposes both the status code and the parsed error_code."""
+    body = (
+        '{"type":"error","error":{"type":"permission_error",'
+        '"message":"Invalid authorization",'
+        '"details":{"error_code":"account_session_invalid"}}}'
+    )
+
+    class _R:
+        status_code = 403
+        text = body
+
+        def json(self_inner):
+            import json
+            return json.loads(body)
+
+    class _MC:
+        def __init__(self, **kwargs):
+            self.headers = {}
+            self.cookies = {}
+
+        def get(self, url, **kwargs):
+            return _R()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(claude_api.httpx, "Client", _MC)
+    f = claude_api.ClaudeUsageFetcher(
+        {"sessionKey": "x"}, user_agent="ua",
+        # org_id set so fetch() doesn't try to discover one first.
+        org_id="00000000-0000-0000-0000-000000000000",
+    )
+    try:
+        assert f.fetch() is None
+        assert f.last_status_code == 403
+        assert f.last_error_code == "account_session_invalid"
+    finally:
+        f.close()
+
+
+def test_fetch_resets_error_state_on_success(monkeypatch):
+    """A successful fetch must clear both attributes so a transient
+    failure doesn't leave the auth-failure flag latched forever."""
+    payload = {
+        "five_hour": {"utilization": 12.5, "resets_at": "2026-06-03T01:00:00Z"},
+        "seven_day": {"utilization": 7.0, "resets_at": "2026-06-08T00:00:00Z"},
+    }
+
+    class _R:
+        status_code = 200
+        text = "ok"
+
+        def json(self_inner):
+            return payload
+
+    class _MC:
+        def __init__(self, **kwargs):
+            self.headers = {}
+            self.cookies = {}
+
+        def get(self, url, **kwargs):
+            return _R()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(claude_api.httpx, "Client", _MC)
+    f = claude_api.ClaudeUsageFetcher(
+        {"sessionKey": "x"}, user_agent="ua",
+        org_id="00000000-0000-0000-0000-000000000000",
+    )
+    try:
+        # Pre-seed with a stale failure state to prove fetch() clears it.
+        f.last_status_code = 403
+        f.last_error_code = "account_session_invalid"
+        result = f.fetch()
+        assert result is not None
+        assert f.last_status_code is None
+        assert f.last_error_code is None
+    finally:
+        f.close()

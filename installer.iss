@@ -43,7 +43,7 @@ RestartApplications=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Messages]
-WelcomeLabel2=This will install [name/ver] on your computer.%n%nFor hands-off auto-refresh, install the included browser extension (Edge or Chrome). After install, open the Start Menu folder for "Browser extension folder" and follow the README inside. Otherwise the widget will use a manual cURL paste fallback.%n%nIt is recommended that you close all other applications before continuing.
+WelcomeLabel2=This will install [name/ver] on your computer.%n%nMost users also need the included browser extension so the widget can read live usage from claude.ai. The final wizard page walks you through that in about 30 seconds. You'll also need to be signed in to https://claude.ai in the browser where you install the extension -- the extension reads cookies from that browser only.%n%nIt is recommended that you close all other applications before continuing.
 
 [Tasks]
 Name: "startupicon"; Description: "Start {#AppName} when Windows starts"; GroupDescription: "Additional options:"; Flags: checkedonce
@@ -328,9 +328,13 @@ begin
       '         ' + ExpandConstant('{app}\extension') + #13#10 +
       '  4. Turn "Developer mode" BACK OFF. The extension keeps' + #13#10 +
       '     running and the warning popup never reappears.' + #13#10 +
-      '  5. Sign into https://claude.ai in Edge if you haven''t already.' + #13#10 + #13#10 +
+      '  5. REQUIRED: sign in to https://claude.ai IN EDGE.' + #13#10 +
+      '     The extension reads cookies from this browser only;' + #13#10 +
+      '     being signed in via Claude desktop or another browser' + #13#10 +
+      '     does not count.' + #13#10 + #13#10 +
       'The tray tooltip will show "Source: Claude browser extension"' + #13#10 +
-      'within a minute. Click Finish when done.';
+      'within a minute. If it instead says "Sign in to claude.ai in' + #13#10 +
+      'your browser", repeat step 5. Click Finish when done.';
 
     L := WizardForm.FinishedLabel;
     leftX := L.Left;
