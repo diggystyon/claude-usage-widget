@@ -41,10 +41,15 @@ Hover the tray icon. The tooltip's **Source:** line tells you which path is acti
 | `Source: browser ext. (Xs ago)` | Working. The extension is pushing fresh data every minute.                                  |
 | `Source: desktop app`         | Working via auto-read. You're on the standalone Electron Claude desktop install; no extension needed. |
 | `Source: manual paste`        | Working via the one-shot cURL paste fallback. Will go stale in a few hours.                  |
-| `Sign in to claude.ai in your browser` | The extension is installed but claude.ai is rejecting it. Sign in to claude.ai in the same browser. |
+| `Claude Usage: setup needed`  | First run, no successful read yet. The bars show a dash, not 0%. Finish setup: right-click the tray icon > **Set up / fix browser extension**. |
+| `Sign in to claude.ai in your browser` | The extension is installed but claude.ai is rejecting it. The bars dim to show they're stale. Sign in to claude.ai in the same browser. |
 | `Cookies expired - sign in to Claude desktop` | No extension, and the desktop / cURL cookies have gone stale. Install the extension or sign back in. |
 
+The icon itself signals state at a glance: bright bars = live, **dimmed** bars = known-stale (sign-in needed), a **centered dash** = no reading yet (setup needed).
+
 If you also see a **`!`** or **`?`** badge on the Claude Usage Bridge icon in your browser toolbar, claude.ai is rejecting the extension's calls -- sign in to https://claude.ai in that browser. Clicking the toolbar icon opens claude.ai for you.
+
+**Stuck?** Right-click the tray icon and choose **Set up / fix browser extension** any time. It opens claude.ai (so you can sign in) and the extension folder (for first-time load-unpacked).
 
 ## If you only use the standalone Electron Claude desktop
 

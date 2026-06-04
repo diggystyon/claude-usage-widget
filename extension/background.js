@@ -177,9 +177,24 @@ function ensureAlarm() {
   });
 }
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   ensureAlarm();
-  fetchAndPost();
+  if (details && details.reason === "install") {
+    // First-ever install. Probe once; if claude.ai rejects us -- which
+    // almost always means the user isn't signed in to claude.ai in THIS
+    // browser, the single most common setup mistake -- open claude.ai so
+    // they can sign in. Gated on reason==="install" so we never reopen a
+    // tab on a routine auto-update. We deliberately do NOT open a tab for
+    // the widget-not-running case (postFailure, not an auth failure):
+    // that has nothing to do with the browser session.
+    fetchAndPost().then(() => {
+      if (consecutiveAuthFailures > 0) {
+        try { chrome.tabs.create({ url: "https://claude.ai/" }); } catch (_) { /* ignore */ }
+      }
+    });
+  } else {
+    fetchAndPost();
+  }
 });
 
 chrome.runtime.onStartup.addListener(() => {

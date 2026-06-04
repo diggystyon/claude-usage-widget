@@ -41,6 +41,7 @@ from claude_api import (
     UPDATE_DOWNLOAD_URL,
     _parse_version,
     _setup_bundled_certifi,
+    classify_display_state,
     fetch_claude_status,
     fetch_latest_version,
 )
@@ -113,6 +114,11 @@ DEFAULT_CONFIG = {
     "poll_seconds": 60,
     "last_source": "",
     "last_failure_notified_at": 0,
+    # False until the first-ever successful read (widget fetch or
+    # extension push). Drives the "unconfigured" icon/tooltip state so a
+    # fresh install shows "setup needed" instead of authoritative-looking
+    # 0%/0% bars. Persisted so a restart doesn't reset to unconfigured.
+    "ever_succeeded": False,
 }
 
 
@@ -244,8 +250,33 @@ def color_for_pct(pct: float) -> Tuple[int, int, int]:
     return (r, g, b)
 
 
+def _mute_rgb(r: int, g: int, b: int) -> Tuple[int, int, int]:
+    """Blend a bar color halfway toward a desaturated slate grey. Used for
+    the 'stale' icon state so known-stale bars read as washed-out vs the
+    saturated live colors, without changing their length (so the user can
+    still see roughly where usage was when it went stale)."""
+    gr, gg, gb = 110, 114, 124
+    return ((r + gr) // 2, (g + gg) // 2, (b + gb) // 2)
+
+
 def render_icon(session_pct: float, weekly_pct: float, size: int = 64,
-                status_dot: Optional[Tuple[int, int, int]] = None) -> Image.Image:
+                status_dot: Optional[Tuple[int, int, int]] = None,
+                state: str = "live") -> Image.Image:
+    """Render the two-bar tray icon.
+
+    state controls how the bars read at a glance, so the icon never shows
+    numbers that look authoritative when they aren't:
+      - "live"          : normal saturated green->red bars.
+      - "stale"         : we have real numbers but recent fetches are
+                          failing auth, so the data is known-stale. Bars
+                          are blended toward grey (visibly muted) so the
+                          user doesn't trust them as current.
+      - "unconfigured"  : we've never had a successful read. Instead of
+                          drawing 0%/0% bars (which look identical to
+                          "barely any usage" and caused real confusion),
+                          draw empty tracks with a centered dash = "no
+                          reading yet".
+    """
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     bg_radius = max(6, size // 8)
@@ -260,10 +291,22 @@ def render_icon(session_pct: float, weekly_pct: float, size: int = 64,
     bar_radius = bar_h // 3
     for y, pct in ((top_y, session_pct), (bot_y, weekly_pct)):
         draw.rounded_rectangle([margin, y, margin + bar_w, y + bar_h], radius=bar_radius, fill=(58, 62, 74, 255))
+        if state == "unconfigured":
+            # Centered dash = "no reading", visually distinct from a
+            # left-anchored colored fill. Skip the data fill entirely.
+            dash_w = max(6, bar_w // 4)
+            dash_h = max(2, bar_h // 4)
+            dx0 = margin + (bar_w - dash_w) // 2
+            dy0 = y + (bar_h - dash_h) // 2
+            draw.rounded_rectangle([dx0, dy0, dx0 + dash_w, dy0 + dash_h],
+                                   radius=dash_h // 2, fill=(150, 154, 165, 255))
+            continue
         clamped = max(0.0, min(100.0, float(pct)))
         fill_w = int(round(bar_w * (clamped / 100.0)))
         if fill_w >= 2:
             r, g, b = color_for_pct(clamped)
+            if state == "stale":
+                r, g, b = _mute_rgb(r, g, b)
             draw.rounded_rectangle([margin, y, margin + fill_w, y + bar_h], radius=bar_radius, fill=(r, g, b, 255))
     # Status dot in the upper-right corner: indicates a claude.ai outage.
     # Hidden entirely when status is operational (dot=None).
@@ -281,6 +324,26 @@ def render_icon(session_pct: float, weekly_pct: float, size: int = 64,
 
 # STATUS_COLORS, CLAUDE_STATUS_URL, fetch_claude_status, _parse_version
 # all live in claude_api.py (imported at the top).
+
+
+def _extension_dir() -> Optional[str]:
+    """Return the path to the bundled browser-extension folder, or None.
+
+    On an installed build, Inno Setup drops the extension next to the exe
+    at {app}\\extension (sys.executable's dir). When running from source,
+    it's the repo's extension/ folder next to this script. The tray's
+    'Set up / fix browser extension' menu item opens whichever exists so
+    the user has a one-click path to the folder for load-unpacked."""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        candidates.append(
+            os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "extension"))
+    candidates.append(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension"))
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    return None
 
 
 def _promote_tray_icon() -> int:
@@ -737,9 +800,19 @@ class TrayApp:
         self.claude_status_label = "All systems operational"
         self.latest_version: Optional[str] = None  # None = not yet checked
 
+    def _display_state(self) -> str:
+        """"unconfigured" | "stale" | "live" -- see
+        claude_api.classify_display_state. Drives the icon, tooltip and
+        menu so a fresh install never shows authoritative-looking 0%/0%
+        bars and known-stale data reads as stale."""
+        return classify_display_state(
+            bool(self.config.get("ever_succeeded", False)),
+            self.consecutive_auth_failures)
+
     def _icon_image(self):
         dot = STATUS_COLORS.get(self.claude_status_key, (None, None))[1]
-        return render_icon(self.session_pct, self.weekly_pct, size=64, status_dot=dot)
+        return render_icon(self.session_pct, self.weekly_pct, size=64,
+                           status_dot=dot, state=self._display_state())
 
     def _status_poll_loop(self) -> None:
         """Every 5 minutes, check status.claude.com for the claude.ai
@@ -824,9 +897,41 @@ class TrayApp:
             self.stop_evt.wait(24 * 3600 if ok else 3600)
 
     def _tooltip(self):
-        # Windows caps tray tooltips at 128 characters via Shell_NotifyIcon's
-        # szTip[]. We aim well below that with abbreviated labels and truncate
-        # defensively at the end.
+        # Windows caps tray tooltips at 128 chars (Shell_NotifyIcon szTip[]).
+        # We keep well under that AND, when something is wrong, lead with the
+        # fix so the actionable line can never be the part that gets cut.
+        def cap(t: str) -> str:
+            return t if len(t) <= 127 else t[:124] + "..."
+
+        state = self._display_state()
+
+        if state == "unconfigured":
+            # Never had a successful read. Don't show 0%/0% (looks like real
+            # low usage); tell the user how to finish setup instead.
+            return cap("Claude Usage: setup needed\n"
+                       "Right-click the tray icon > Set up browser extension")
+
+        s_reset = fmt_reset(self.config.get("session_resets_at", ""), short=True)
+        w_reset = fmt_reset(self.config.get("weekly_resets_at", ""), short=False)
+        s_line = f"Session: {self.session_pct:.0f}%"
+        if s_reset:
+            s_line += f"  ({s_reset})"
+        elif self.session_pct < 0.5:
+            # No active 5-hour window yet -- the API only sets resets_at after
+            # the user's first message of the session.
+            s_line += "  (idle)"
+        w_line = f"Weekly:  {self.weekly_pct:.0f}%"
+        if w_reset:
+            w_line += f"  ({w_reset})"
+
+        if state == "stale":
+            # Known-stale data: lead the third line with the fix. The old
+            # code appended the hint LAST, where the 127-char cap truncated
+            # it first -- exactly the line the user needed to see.
+            hint = self._auth_failure_hint(self.config.get("last_source", ""))
+            return cap(f"{s_line}\n{w_line}\n{hint}")
+
+        # live
         last_source = self.config.get("last_source") or "-"
         # Abbreviate the source for the tooltip (full name still in the menu).
         src_short = {
@@ -844,24 +949,7 @@ class TrayApp:
             else:
                 src_short += f" ({int(gap / 3600)}h ago)"
 
-        s_reset = fmt_reset(self.config.get("session_resets_at", ""), short=True)
-        w_reset = fmt_reset(self.config.get("weekly_resets_at", ""), short=False)
-        s_line = f"Session: {self.session_pct:.0f}%"
-        if s_reset:
-            s_line += f"  ({s_reset})"
-        elif self.session_pct < 0.5:
-            # No active 5-hour window yet -- the API only sets resets_at after
-            # the user's first message of the session.
-            s_line += "  (idle)"
-        w_line = f"Weekly:  {self.weekly_pct:.0f}%"
-        if w_reset:
-            w_line += f"  ({w_reset})"
-
-        text = f"{s_line}\n{w_line}\nSource: {src_short}\n{self.last_status}"
-        # Defensive cap: never let pystray throw a ValueError.
-        if len(text) > 127:
-            text = text[:124] + "..."
-        return text
+        return cap(f"{s_line}\n{w_line}\nSource: {src_short}\n{self.last_status}")
 
     def _refresh_icon(self):
         if self.icon:
@@ -977,6 +1065,7 @@ class TrayApp:
                 self.config["last_source"] = source_label
                 if fetcher.org_id and not self.config.get("org_id"):
                     self.config["org_id"] = fetcher.org_id
+                self.config["ever_succeeded"] = True
                 save_config(self.config)
                 self.last_status = f"Updated {fmt_time_12h()}"
                 self.consecutive_auth_failures = 0
@@ -1131,13 +1220,31 @@ class TrayApp:
             return f"Update available: v{self.latest_version}  (click to download)"
         return f"Claude Usage v{__version__}  (click to download folder)"
 
+    def _menu_pct_line(self) -> str:
+        # Don't show "0%   0%" before the first successful read -- it looks
+        # like real low usage. Mirror the icon's unconfigured state.
+        if self._display_state() == "unconfigured":
+            return "Session: --   Weekly: --   (setup needed)"
+        return (f"Session: {self.session_pct:.0f}%   "
+                f"Weekly: {self.weekly_pct:.0f}%")
+
+    def _menu_status_line(self) -> str:
+        # Same state-aware call-to-action the tooltip uses, so the hover
+        # path and the click path tell the user the same story.
+        state = self._display_state()
+        if state == "unconfigured":
+            return "Set up the browser extension and sign in to claude.ai"
+        if state == "stale":
+            return self._auth_failure_hint(self.config.get("last_source", ""))
+        return f"Source: {self.config.get('last_source') or '-'}"
+
     def _build_menu(self):
         return pystray.Menu(
             pystray.MenuItem(
-                lambda item: f"Session: {self.session_pct:.0f}%   Weekly: {self.weekly_pct:.0f}%",
+                lambda item: self._menu_pct_line(),
                 None, enabled=False),
             pystray.MenuItem(
-                lambda item: f"Source: {self.config.get('last_source') or '-'}",
+                lambda item: self._menu_status_line(),
                 None, enabled=False),
             pystray.MenuItem(
                 lambda item: f"Claude.ai: {self.claude_status_label}",
@@ -1156,12 +1263,34 @@ class TrayApp:
                 self.action_toggle_notify,
                 checked=lambda item: bool(self.config.get("notify_on_failure", True))),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Set up / fix browser extension...", self.action_setup_extension),
             pystray.MenuItem("Paste cURL command (fallback)...", self.action_paste_curl),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open Windows tray icon settings", self.action_open_tray_settings),
             pystray.MenuItem("Open log folder", self.action_open_log),
             pystray.MenuItem("Quit", self.action_quit),
         )
+
+    def action_setup_extension(self, icon, item) -> None:
+        """One-click setup / recovery path for the browser extension.
+
+        Opens claude.ai (a signed-out browser session is the single most
+        common reason the extension stops working) and, if the bundled
+        extension folder is present, opens it in Explorer for first-time
+        load-unpacked. Best-effort; failures are logged, not surfaced."""
+        try:
+            # os.startfile with an http URL launches the default browser.
+            os.startfile("https://claude.ai/")
+        except Exception:
+            logging.exception("setup-extension: open claude.ai failed")
+        ext = _extension_dir()
+        if ext:
+            try:
+                os.startfile(ext)
+            except Exception:
+                logging.exception("setup-extension: open extension folder failed")
+        else:
+            logging.info("setup-extension: bundled extension folder not found")
 
     def _on_activity(self) -> None:
         threading.Thread(target=self._fetch_once, daemon=True).start()
@@ -1185,6 +1314,7 @@ class TrayApp:
         if new_src != prev:
             logging.info("source changed: %r -> %r", prev or "(none)", new_src)
         self.config["last_source"] = new_src
+        self.config["ever_succeeded"] = True
         self.last_extension_push_at = time.time()
         self.last_status = f"Updated {fmt_time_12h()}"
         # A successful push from the extension implicitly proves claude.ai

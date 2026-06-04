@@ -42,6 +42,7 @@ from claude_api import (
     UPDATE_DOWNLOAD_URL,
     _parse_version,
     _setup_bundled_certifi,
+    classify_display_state,
     fetch_claude_status,
     fetch_latest_version,
 )
@@ -97,6 +98,10 @@ DEFAULT_CONFIG = {
     "last_source": "",
     "last_failure_notified_at": 0,
     "org_id": "",
+    # False until the first-ever successful read. Drives the
+    # "unconfigured" icon/menu state so a fresh install shows a setup hint
+    # instead of authoritative-looking 0%/0% bars. Persisted across runs.
+    "ever_succeeded": False,
 }
 
 
@@ -168,10 +173,23 @@ def color_for_pct(pct: float) -> Tuple[int, int, int]:
     return (r, g, b)
 
 
+def _mute_rgb(r: int, g: int, b: int) -> Tuple[int, int, int]:
+    """Blend a bar color halfway toward a desaturated slate grey, for the
+    'stale' icon state (known-stale data reads as washed-out vs live)."""
+    gr, gg, gb = 110, 114, 124
+    return ((r + gr) // 2, (g + gg) // 2, (b + gb) // 2)
+
+
 def render_icon(session_pct: float, weekly_pct: float, size: int = 44,
-                status_dot: Optional[Tuple[int, int, int]] = None) -> Image.Image:
+                status_dot: Optional[Tuple[int, int, int]] = None,
+                state: str = "live") -> Image.Image:
     """Render the two-bar icon. size is the @2x retina dimension; macOS
-    will auto-scale this down to ~22pt on standard displays."""
+    will auto-scale this down to ~22pt on standard displays.
+
+    state ("live"|"stale"|"unconfigured") keeps the icon from ever showing
+    authoritative-looking numbers it shouldn't: "stale" mutes the bars,
+    "unconfigured" replaces them with a centered dash (= no reading yet)
+    instead of empty 0%/0% tracks that look like real low usage."""
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     bg_radius = max(4, size // 8)
@@ -188,10 +206,20 @@ def render_icon(session_pct: float, weekly_pct: float, size: int = 44,
     for y, pct in ((top_y, session_pct), (bot_y, weekly_pct)):
         draw.rounded_rectangle([margin, y, margin + bar_w, y + bar_h],
                                radius=bar_radius, fill=(58, 62, 74, 255))
+        if state == "unconfigured":
+            dash_w = max(5, bar_w // 4)
+            dash_h = max(2, bar_h // 4)
+            dx0 = margin + (bar_w - dash_w) // 2
+            dy0 = y + (bar_h - dash_h) // 2
+            draw.rounded_rectangle([dx0, dy0, dx0 + dash_w, dy0 + dash_h],
+                                   radius=dash_h // 2, fill=(150, 154, 165, 255))
+            continue
         clamped = max(0.0, min(100.0, float(pct)))
         fill_w = int(round(bar_w * (clamped / 100.0)))
         if fill_w >= 2:
             r, g, b = color_for_pct(clamped)
+            if state == "stale":
+                r, g, b = _mute_rgb(r, g, b)
             draw.rounded_rectangle([margin, y, margin + fill_w, y + bar_h],
                                    radius=bar_radius, fill=(r, g, b, 255))
     if status_dot is not None:
@@ -484,8 +512,17 @@ class MenuBarApp(rumps.App):
         except queue.Empty:
             pass
 
+    def _display_state(self) -> str:
+        """"unconfigured" | "stale" | "live" -- see
+        claude_api.classify_display_state. Mirrors the Windows tray so both
+        platforms render the same three states from the same inputs."""
+        return classify_display_state(
+            bool(self.config.get("ever_succeeded", False)),
+            self.consecutive_auth_failures)
+
     def _do_write_icon(self, session_pct: float, weekly_pct: float,
-                       dot: Optional[Tuple[int, int, int]]) -> Path:
+                       dot: Optional[Tuple[int, int, int]],
+                       state: str = "live") -> Path:
         """Main-thread only. Renders the icon PNG to a rotating path
         (icon_a.png <-> icon_b.png) via an atomic .tmp + os.replace, so
         rumps never sees a half-written file AND always gets a fresh
@@ -495,7 +532,8 @@ class MenuBarApp(rumps.App):
         target = _ICON_PATHS[idx]
         tmp = target.with_suffix(target.suffix + ".tmp")
         try:
-            img = render_icon(session_pct, weekly_pct, size=44, status_dot=dot)
+            img = render_icon(session_pct, weekly_pct, size=44,
+                              status_dot=dot, state=state)
             img.save(str(tmp), format="PNG")
             os.replace(str(tmp), str(target))
         except Exception:
@@ -524,31 +562,38 @@ class MenuBarApp(rumps.App):
         """Main-thread only. Renders the icon + updates every menu item.
         Must be called from inside _drain_ui_queue (or __init__, before
         any background threads exist)."""
+        state = self._display_state()
         dot = STATUS_COLORS.get(self.claude_status_key, (None, None))[1]
-        new_path = self._do_write_icon(self.session_pct, self.weekly_pct, dot)
+        new_path = self._do_write_icon(self.session_pct, self.weekly_pct,
+                                       dot, state=state)
         try:
             self.icon = str(new_path)
         except Exception:
             logging.exception("icon reassign failed")
 
         src = self.config.get("last_source") or "-"
-        self.mi_pct.title = (
-            f"Session: {self.session_pct:.0f}%   "
-            f"Weekly: {self.weekly_pct:.0f}%"
-        )
-        s_reset = fmt_reset(self.config.get("session_resets_at", ""), short=True)
-        w_reset = fmt_reset(self.config.get("weekly_resets_at", ""), short=False)
-        if s_reset and w_reset:
-            self.mi_pct.title += f"   |   resets {s_reset} / {w_reset}"
-        # After 3 consecutive account_session_invalid responses, surface
-        # a sign-in hint on the Source line. The bars themselves stay
-        # frozen at the last successful read until the user re-auths.
-        # We don't gate on N=1 because a single transient 401 from a
-        # token refresh shouldn't flip the menu into an alarm state.
-        if self.consecutive_auth_failures >= 3:
-            self.mi_source.title = f"Source: {src} -- sign in to Claude desktop"
+        if state == "unconfigured":
+            # Never had a successful read: don't show 0%/0% (looks like
+            # real low usage). Tell the user how to finish setup.
+            self.mi_pct.title = "Session: --   Weekly: --   (setup needed)"
+            self.mi_source.title = "Sign in to the Claude desktop app"
         else:
-            self.mi_source.title = f"Source: {src}"
+            self.mi_pct.title = (
+                f"Session: {self.session_pct:.0f}%   "
+                f"Weekly: {self.weekly_pct:.0f}%"
+            )
+            s_reset = fmt_reset(self.config.get("session_resets_at", ""), short=True)
+            w_reset = fmt_reset(self.config.get("weekly_resets_at", ""), short=False)
+            if s_reset and w_reset:
+                self.mi_pct.title += f"   |   resets {s_reset} / {w_reset}"
+            # "stale" == >=3 consecutive account_session_invalid responses.
+            # The bars stay frozen at the last good read until re-auth, so
+            # we say so on the Source line. We don't gate on N=1 because a
+            # single transient 401 from a token refresh shouldn't alarm.
+            if state == "stale":
+                self.mi_source.title = f"Source: {src} -- sign in to Claude desktop"
+            else:
+                self.mi_source.title = f"Source: {src}"
         self.mi_status.title = f"Claude.ai: {self.claude_status_label}"
         self.mi_version.title = self._version_label()
 
@@ -663,6 +708,7 @@ class MenuBarApp(rumps.App):
         self.config["last_source"] = source
         if f.org_id:
             self.config["org_id"] = f.org_id
+        self.config["ever_succeeded"] = True
         save_config(self.config)
         self.last_fetch_at = time.time()
         self.consecutive_auth_failures = 0

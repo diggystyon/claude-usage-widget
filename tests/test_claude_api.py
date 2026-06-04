@@ -38,6 +38,42 @@ def test_parse_version_ordering():
     assert claude_api._parse_version("1.2.0") == claude_api._parse_version("1.2.0")
 
 
+# ---------- classify_display_state (v1.3.5) ----------
+
+def test_display_state_unconfigured_when_never_succeeded():
+    # Fresh install: no successful read yet -> setup-needed state, even if
+    # session_pct happens to be 0. This is the fix for "0%/1% looked like
+    # real data" -- the widget must not present absent data as live.
+    assert claude_api.classify_display_state(False, 0) == "unconfigured"
+
+
+def test_display_state_unconfigured_beats_stale():
+    # Priority: a brand-new install that is ALSO failing auth should read
+    # as 'set me up', not 'your data went stale'. unconfigured wins.
+    assert claude_api.classify_display_state(False, 99) == "unconfigured"
+
+
+def test_display_state_live_when_succeeded_and_no_failures():
+    assert claude_api.classify_display_state(True, 0) == "live"
+
+
+def test_display_state_live_below_stale_threshold():
+    # One or two transient auth blips (e.g. a session rotation) must NOT
+    # flip the UI into an alarm state. Only sticky failure is "stale".
+    assert claude_api.classify_display_state(True, 1) == "live"
+    assert claude_api.classify_display_state(True, 2) == "live"
+
+
+def test_display_state_stale_at_threshold():
+    assert claude_api.classify_display_state(True, 3) == "stale"
+    assert claude_api.classify_display_state(True, 10) == "stale"
+
+
+def test_display_state_respects_custom_threshold():
+    assert claude_api.classify_display_state(True, 2, stale_threshold=2) == "stale"
+    assert claude_api.classify_display_state(True, 1, stale_threshold=2) == "live"
+
+
 # ---------- ClaudeUsageFetcher._extract_percents ----------
 
 def test_extract_percents_five_hour_seven_day_shape():

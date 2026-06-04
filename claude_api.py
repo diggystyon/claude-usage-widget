@@ -34,6 +34,7 @@ What does NOT live here:
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -243,6 +244,36 @@ def fetch_latest_version(user_agent: str) -> Optional[str]:
     except Exception:
         logging.exception("update check failed")
     return None
+
+
+# ---------- shared display-state classification ----------
+
+def classify_display_state(ever_succeeded: bool,
+                           consecutive_auth_failures: int,
+                           stale_threshold: int = 3) -> str:
+    """Decide what the tray icon / menu-bar icon should convey, so both
+    platforms render the same three states from the same inputs.
+
+    Returns one of:
+      - "unconfigured": no successful read has ever happened. The UI
+        should show a 'setup needed' affordance instead of 0%/0% bars
+        (which look identical to real low usage and caused real user
+        confusion -- a fresh widget reading 0%/1% was mistaken for live
+        data).
+      - "stale": we have data from a past success, but recent fetches are
+        failing authentication (>= stale_threshold in a row). The shown
+        numbers are frozen/known-stale; the UI should say so.
+      - "live": the numbers are current.
+
+    Priority matters: 'unconfigured' is checked before 'stale' so a brand
+    new install that is ALSO failing auth reads as 'set me up', not 'your
+    data went stale'.
+    """
+    if not ever_succeeded:
+        return "unconfigured"
+    if consecutive_auth_failures >= stale_threshold:
+        return "stale"
+    return "live"
 
 
 # ---------- claude.ai usage API client ----------

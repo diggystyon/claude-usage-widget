@@ -317,7 +317,9 @@ begin
       'Microsoft Edge and File Explorer have just opened.' + #13#10 +
       'They may be behind this wizard -- use Alt+Tab or your taskbar' + #13#10 +
       'to switch between them.' + #13#10 +
-      'The URL "edge://extensions/" is already on your clipboard.' + #13#10 + #13#10 +
+      'The URL "edge://extensions/" is already on your clipboard.' + #13#10 +
+      'Prefer Chrome? Close the Edge window and use chrome://extensions/' + #13#10 +
+      'instead -- every step below is identical.' + #13#10 + #13#10 +
       'To enable hands-off auto-refresh (one-time, ~30 seconds):' + #13#10 + #13#10 +
       '  1. Switch to Edge. Press Ctrl+L (focus address bar),' + #13#10 +
       '     Ctrl+V (paste URL), Enter. (Or paste edge://extensions/)' + #13#10 +
