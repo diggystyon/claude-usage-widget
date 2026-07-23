@@ -6,6 +6,8 @@ hit the network -- httpx clients are mocked or simply not constructed.
 """
 from __future__ import annotations
 
+import os
+
 import claude_api
 
 
@@ -563,6 +565,173 @@ def test_fetch_latest_version_passes_user_agent(monkeypatch):
     monkeypatch.setattr(claude_api.httpx, "Client", _MC)
     claude_api.fetch_latest_version("my-app/1.2.3")
     assert seen_headers.get("User-Agent") == "my-app/1.2.3"
+
+
+# ---------- CA bundle persistence (mid-run temp-cleaner hardening) ----------
+#
+# Regression coverage for the recurring failure where PyInstaller's
+# extracted cacert.pem is deleted from the _MEI temp dir by a disk/temp
+# cleaner while the widget runs, breaking all TLS. The fix relocates the
+# bundle to a stable, widget-owned dir and re-resolves if it ever goes
+# missing. See _persist_ca_bundle / _setup_bundled_certifi / _ensure_ca_bundle.
+
+
+def test_stable_ca_dir_windows_branch(monkeypatch, tmp_path):
+    """Non-mac uses %APPDATA%\\ClaudeUsageTray (mirrors the entry scripts'
+    CONFIG_DIR so the bundle sits next to config.json)."""
+    monkeypatch.setattr(claude_api.sys, "platform", "win32")
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    assert claude_api._stable_ca_dir() == os.path.join(str(tmp_path), "ClaudeUsageTray")
+
+
+def test_stable_ca_dir_mac_branch(monkeypatch):
+    """macOS uses ~/Library/Application Support/ClaudeUsageTray."""
+    monkeypatch.setattr(claude_api.sys, "platform", "darwin")
+    d = claude_api._stable_ca_dir()
+    assert d.endswith(os.path.join("Library", "Application Support", "ClaudeUsageTray"))
+
+
+def test_persist_ca_bundle_copies_to_stable_dir(monkeypatch, tmp_path):
+    """A resolved temp bundle is copied into the stable dir; the returned
+    path is the stable copy and it has the source's contents."""
+    src = tmp_path / "src" / "cacert.pem"
+    src.parent.mkdir()
+    src.write_text("CERTDATA")
+    stable = tmp_path / "stable"
+    monkeypatch.setattr(claude_api, "_stable_ca_dir", lambda: str(stable))
+    dest = claude_api._persist_ca_bundle(str(src))
+    assert dest == os.path.join(str(stable), "cacert.pem")
+    assert os.path.isfile(dest)
+    with open(dest) as f:
+        assert f.read() == "CERTDATA"
+
+
+def test_persist_ca_bundle_noop_when_src_is_dest(monkeypatch, tmp_path):
+    """If the source already IS the stable copy, return it without copying
+    onto itself."""
+    stable = tmp_path / "stable"
+    stable.mkdir()
+    dest = stable / "cacert.pem"
+    dest.write_text("X")
+    monkeypatch.setattr(claude_api, "_stable_ca_dir", lambda: str(stable))
+    got = claude_api._persist_ca_bundle(str(dest))
+    assert got == os.path.join(str(stable), "cacert.pem")
+    assert dest.read_text() == "X"
+
+
+def test_persist_ca_bundle_skips_recopy_when_same_size(monkeypatch, tmp_path):
+    """An existing stable copy of the same size is treated as current and
+    left untouched (cheap once-per-launch check, no needless write)."""
+    src = tmp_path / "cacert.pem"
+    src.write_text("AAAA")  # 4 bytes
+    stable = tmp_path / "stable"
+    stable.mkdir()
+    dest = stable / "cacert.pem"
+    dest.write_text("BBBB")  # same size, different content
+    monkeypatch.setattr(claude_api, "_stable_ca_dir", lambda: str(stable))
+    claude_api._persist_ca_bundle(str(src))
+    assert dest.read_text() == "BBBB"
+
+
+def test_persist_ca_bundle_recopies_when_size_differs(monkeypatch, tmp_path):
+    """A new release ships a different-size bundle -> refresh the stable
+    copy."""
+    src = tmp_path / "cacert.pem"
+    src.write_text("AAAAAAAA")  # 8 bytes
+    stable = tmp_path / "stable"
+    stable.mkdir()
+    dest = stable / "cacert.pem"
+    dest.write_text("BBBB")  # 4 bytes
+    monkeypatch.setattr(claude_api, "_stable_ca_dir", lambda: str(stable))
+    claude_api._persist_ca_bundle(str(src))
+    assert dest.read_text() == "AAAAAAAA"
+
+
+def test_persist_ca_bundle_returns_src_on_failure(monkeypatch, tmp_path):
+    """If the copy can't be made, fall back to the original path -- a temp
+    cert is better than none."""
+    src = tmp_path / "cacert.pem"
+    src.write_text("X")
+    monkeypatch.setattr(claude_api, "_stable_ca_dir", lambda: str(tmp_path / "stable"))
+
+    def boom(*a, **k):
+        raise OSError("nope")
+
+    monkeypatch.setattr(claude_api.os, "makedirs", boom)
+    assert claude_api._persist_ca_bundle(str(src)) == str(src)
+
+
+def test_setup_certifi_persists_when_frozen(monkeypatch, tmp_path):
+    """In a frozen bundle, the resolved cert is routed through
+    _persist_ca_bundle and SSL_CERT_FILE points at the result."""
+    import certifi
+    fake = tmp_path / "cacert.pem"
+    fake.write_text("X")
+    monkeypatch.setattr(certifi, "where", lambda: str(fake))
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+    monkeypatch.setattr(claude_api.sys, "frozen", True, raising=False)
+    calls = []
+
+    def spy(src):
+        calls.append(src)
+        return src
+
+    monkeypatch.setattr(claude_api, "_persist_ca_bundle", spy)
+    claude_api._setup_bundled_certifi()
+    assert calls == [os.path.normpath(str(fake))]
+    assert os.environ["SSL_CERT_FILE"] == os.path.normpath(str(fake))
+    assert os.environ["REQUESTS_CA_BUNDLE"] == os.path.normpath(str(fake))
+
+
+def test_setup_certifi_does_not_persist_when_not_frozen(monkeypatch, tmp_path):
+    """In dev/test (not frozen) the site-packages bundle is used directly;
+    we must not write into %APPDATA%."""
+    import certifi
+    fake = tmp_path / "cacert.pem"
+    fake.write_text("X")
+    monkeypatch.setattr(certifi, "where", lambda: str(fake))
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+    monkeypatch.setattr(claude_api.sys, "frozen", False, raising=False)
+    calls = []
+    monkeypatch.setattr(claude_api, "_persist_ca_bundle", lambda s: calls.append(s))
+    claude_api._setup_bundled_certifi()
+    assert calls == []
+    assert os.environ["SSL_CERT_FILE"] == os.path.normpath(str(fake))
+
+
+def test_ensure_ca_bundle_noop_when_not_frozen(monkeypatch):
+    """Guard is inert outside a frozen bundle -- no re-resolution attempts
+    during ordinary dev/test runs."""
+    monkeypatch.setattr(claude_api.sys, "frozen", False, raising=False)
+    called = []
+    monkeypatch.setattr(claude_api, "_setup_bundled_certifi", lambda: called.append(1))
+    claude_api._ensure_ca_bundle()
+    assert called == []
+
+
+def test_ensure_ca_bundle_reresolves_when_frozen_and_missing(monkeypatch, tmp_path):
+    """Frozen + SSL_CERT_FILE points at a now-deleted file -> re-run
+    resolution instead of letting httpx crash on it."""
+    monkeypatch.setattr(claude_api.sys, "frozen", True, raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "gone.pem"))
+    called = []
+    monkeypatch.setattr(claude_api, "_setup_bundled_certifi", lambda: called.append(1))
+    claude_api._ensure_ca_bundle()
+    assert called == [1]
+
+
+def test_ensure_ca_bundle_noop_when_frozen_and_present(monkeypatch, tmp_path):
+    """Frozen + the bundle still exists -> cheap early return, no work."""
+    p = tmp_path / "cacert.pem"
+    p.write_text("X")
+    monkeypatch.setattr(claude_api.sys, "frozen", True, raising=False)
+    monkeypatch.setenv("SSL_CERT_FILE", str(p))
+    called = []
+    monkeypatch.setattr(claude_api, "_setup_bundled_certifi", lambda: called.append(1))
+    claude_api._ensure_ca_bundle()
+    assert called == []
 
 
 # ---------- error_code parsing on non-200 (v1.3.4) ----------

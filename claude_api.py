@@ -67,9 +67,85 @@ STATUS_COLORS: Dict[str, Tuple[str, Optional[Tuple[int, int, int]]]] = {
 
 # ---------- TLS CA bundle resolution ----------
 
+def _stable_ca_dir() -> str:
+    """Directory the widget owns for a persistent copy of the CA bundle.
+
+    Deliberately NOT a temp dir -- the whole point is a location Storage
+    Sense / Disk Cleanup / an AV cleaner will leave alone. Mirrors the
+    entry scripts' CONFIG_DIR so the bundle sits next to config.json:
+      Windows: %APPDATA%\\ClaudeUsageTray  (or ~/.config/... if APPDATA unset)
+      macOS:   ~/Library/Application Support/ClaudeUsageTray
+    """
+    if sys.platform == "darwin":
+        return os.path.join(
+            os.path.expanduser("~"), "Library", "Application Support", "ClaudeUsageTray"
+        )
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "ClaudeUsageTray")
+
+
+def _persist_ca_bundle(src: str) -> str:
+    """Copy the resolved CA bundle to a stable, widget-owned location and
+    return that path (or ``src`` unchanged if the copy can't be made --
+    better a temp cert than none).
+
+    Why this exists: PyInstaller --onefile extracts cacert.pem to a temp
+    dir (_MEI<rand>). That file is plain data -- unlike the running
+    .exe/.pyd it is not held open -- so a temp/disk cleaner can delete it
+    while the widget keeps running. After that, every new httpx.Client()
+    throws FileNotFoundError in ssl.create_default_context and all HTTPS
+    breaks: the usage fetch and update check hard-crash, and only the
+    status fetch survives on its unverified fallback (which floods the log
+    with 'status fetch succeeded via SSL fallback unverified'). Copying the
+    bundle into %APPDATA% / Application Support puts it somewhere cleaners
+    do not touch, so SSL_CERT_FILE stays valid for the life of the process.
+    """
+    try:
+        stable_dir = _stable_ca_dir()
+        dest = os.path.join(stable_dir, "cacert.pem")
+        if os.path.normpath(src) == os.path.normpath(dest):
+            return dest
+        os.makedirs(stable_dir, exist_ok=True)
+        # Refresh only when missing or a different size (a new release ships
+        # an updated bundle). Write to a temp name then atomically swap so a
+        # concurrent read never sees a half-written file.
+        need_copy = True
+        if os.path.isfile(dest):
+            try:
+                need_copy = os.path.getsize(dest) != os.path.getsize(src)
+            except OSError:
+                need_copy = True
+        if need_copy:
+            import shutil
+            import threading
+            # Unique temp name per writer: the poll loop and the extension
+            # bridge can both construct a fetcher (and thus land here) at the
+            # same instant. A shared ".tmp" would let their copyfile() calls
+            # interleave; per-writer names keep each copy whole, and os.replace
+            # is atomic so the reader only ever sees a complete cacert.pem.
+            tmp = dest + ".%d.%d.tmp" % (os.getpid(), threading.get_ident())
+            shutil.copyfile(src, tmp)
+            try:
+                os.replace(tmp, dest)
+            except OSError:
+                # e.g. an AV briefly locking dest -- clean up our temp so a
+                # failed swap can't leave orphaned .tmp files behind, then let
+                # the outer handler log and fall back to the source path.
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
+        if os.path.isfile(dest):
+            return dest
+    except Exception:
+        logging.exception("could not persist CA bundle to stable dir")
+    return src
+
+
 def _setup_bundled_certifi() -> None:
     """Make TLS verification work inside the PyInstaller bundle, on both
-    Windows (.exe) and macOS (.app).
+    Windows (.exe) and macOS (.app), and keep it working for the whole run.
 
     PyInstaller's --collect-data certifi flag copies cacert.pem into the
     bundle, but at runtime certifi.where() can still return a path that
@@ -84,6 +160,10 @@ def _setup_bundled_certifi() -> None:
       3. {sys._MEIPASS}/certifi/cacert.pem  -- PyInstaller --onefile
       4. {exe_dir}/../Resources/certifi/cacert.pem  -- macOS .app layout
       5. {exe_dir}/certifi/cacert.pem  -- PyInstaller --onedir
+
+    In a frozen bundle the resolved file is then copied to a stable,
+    widget-owned dir (see _persist_ca_bundle) because the _MEI copy can be
+    deleted mid-run by a temp cleaner, which otherwise breaks all TLS.
     """
     try:
         if os.environ.get("SSL_CERT_FILE") and os.path.isfile(os.environ["SSL_CERT_FILE"]):
@@ -107,6 +187,10 @@ def _setup_bundled_certifi() -> None:
                 continue
             resolved = os.path.normpath(path)
             if os.path.isfile(resolved):
+                # In a frozen bundle, harden against mid-run deletion of the
+                # temp _MEI copy by relocating to a stable, owned path.
+                if getattr(sys, "frozen", False):
+                    resolved = _persist_ca_bundle(resolved)
                 os.environ["SSL_CERT_FILE"] = resolved
                 os.environ["REQUESTS_CA_BUNDLE"] = resolved
                 logging.info("TLS CA bundle: %s", resolved)
@@ -114,6 +198,25 @@ def _setup_bundled_certifi() -> None:
         logging.warning("no CA bundle found; httpx will fall back to verify=False")
     except Exception:
         logging.exception("certifi bundle setup failed")
+
+
+def _ensure_ca_bundle() -> None:
+    """Cheap guard, run right before each httpx.Client is built.
+
+    If the file SSL_CERT_FILE points at has gone missing (a cleaner deleted
+    even the stable copy, or it was never resolved), re-run resolution so we
+    recover instead of hard-crashing on ssl.create_default_context. No-op
+    unless frozen: in dev/test the bundle lives in site-packages and never
+    disappears, and we do not want to touch %APPDATA% during tests.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    cur = os.environ.get("SSL_CERT_FILE")
+    if cur and os.path.isfile(cur):
+        return
+    os.environ.pop("SSL_CERT_FILE", None)
+    os.environ.pop("REQUESTS_CA_BUNDLE", None)
+    _setup_bundled_certifi()
 
 
 # ---------- claude.ai status page (Statuspage) ----------
@@ -379,6 +482,13 @@ class ClaudeUsageFetcher:
             if k.lower() in _STRIPPED_HEADERS:
                 continue
             headers[k] = v
+        # Re-resolve the CA bundle if it vanished since startup (a temp
+        # cleaner deleting the extracted cacert.pem is a real, recurring
+        # failure -- see _persist_ca_bundle). Without this, a missing bundle
+        # crashes httpx.Client() in ssl.create_default_context. We never fall
+        # back to verify=False here: this client carries the auth cookie, so
+        # unverified TLS would be a MITM risk.
+        _ensure_ca_bundle()
         self.client = httpx.Client(
             headers=headers, cookies=self.cookies,
             timeout=20.0, follow_redirects=True,

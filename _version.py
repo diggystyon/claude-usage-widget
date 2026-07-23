@@ -18,4 +18,4 @@ That keeps the user-visible "extension version" stable across cosmetic
 widget releases and tells them something actually shifted on the
 extension side when it does change.
 """
-__version__ = "1.3.6"
+__version__ = "1.3.7"
